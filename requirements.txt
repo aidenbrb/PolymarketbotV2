@@ -1,0 +1,7 @@
+requests>=2.31
+websocket-client>=1.8
+python-dotenv>=1.0
+tabulate>=0.9
+pytest>=7.4
+pytest-mock>=3.12
+responses>=0.24

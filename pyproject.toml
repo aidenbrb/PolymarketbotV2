@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+description = "Polymarket paper-trading research assistant, plus an opt-in live market-making module."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "websocket-client>=1.8",
+    "python-dotenv>=1.0",
+    "tabulate>=0.9",
+]
+
+[project.optional-dependencies]
+# Only needed to actually run `live-start`/`live-status`/`live-cancel-all`
+# (Ed25519 request signing for Polymarket US). Every paper-trading command
+# works with zero extra installs.
+live = ["cryptography>=42.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
