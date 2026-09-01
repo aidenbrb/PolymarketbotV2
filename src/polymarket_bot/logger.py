@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 
 from . import config
@@ -16,7 +17,8 @@ def setup_logging(log_level: str | None = None) -> None:
         return
 
     config.ensure_data_dirs()
-    level = getattr(logging, (log_level or config.load_settings().log_level).upper(), logging.INFO)
+    settings = config.load_settings()
+    level = getattr(logging, (log_level or settings.log_level).upper(), logging.INFO)
 
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -46,11 +48,24 @@ def setup_logging(log_level: str | None = None) -> None:
     # the whole test session (pytest imports itself before collecting any
     # test module), so this never fires in a real `live-start` process.
     if "pytest" not in sys.modules:
-        file_handler = logging.FileHandler(config.LOGS_DIR / "bot.log", encoding="utf-8")
+        file_handler = _build_file_handler(settings)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
 
     _CONFIGURED = True
+
+
+def _build_file_handler(settings: config.Settings) -> logging.handlers.RotatingFileHandler:
+    # Rotating, not a plain FileHandler -- a confirmed real incident left a
+    # crashed process's diagnostic trail effectively undiagnosable;
+    # rotation keeps the file bounded regardless of run length. See
+    # live/RUNBOOK.md's most recent section.
+    return logging.handlers.RotatingFileHandler(
+        config.LOGS_DIR / "bot.log",
+        maxBytes=settings.log_max_bytes,
+        backupCount=settings.log_backup_count,
+        encoding="utf-8",
+    )
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -10,9 +10,11 @@ from polymarket_bot.live.fills import (
     compute_markout_cents,
     find_due_markout_windows,
     get_all_fills,
+    get_backfill_resolved_order_ids,
     is_actual_fill,
     migrate_legacy_fills,
     parse_transact_time,
+    record_backfill_resolved,
     record_fill,
     resolve_order_id_and_market_slug,
 )
@@ -22,6 +24,7 @@ from polymarket_bot.live.models import FillRecord
 @pytest.fixture
 def isolated_fills(tmp_path, monkeypatch):
     monkeypatch.setattr(fills_module, "FILLS_FILE", tmp_path / "fills.json")
+    monkeypatch.setattr(fills_module, "BACKFILL_RESOLVED_FILE", tmp_path / "backfill_resolved_orders.json")
 
 
 def _fill(fill_id="f1", market_slug="m1"):
@@ -32,6 +35,8 @@ def _fill(fill_id="f1", market_slug="m1"):
         side="BUY",
         price=0.45,
         shares=10.0,
+        outcome="YES",
+        commission_usd=-0.02,
         execution_type="EXECUTION_TYPE_FILL",
         transact_time="2026-07-06T00:00:00.000000000Z",
         quoted_price=0.45,
@@ -42,6 +47,8 @@ def _fill(fill_id="f1", market_slug="m1"):
         markout_1m_computed_at=None,
         markout_5m_cents=None,
         markout_5m_computed_at=None,
+        markout_15m_cents=None,
+        markout_15m_computed_at=None,
         detected_at="2026-07-06T00:00:00+00:00",
         raw_execution={"id": fill_id},
     )
@@ -62,7 +69,9 @@ def _execution(**overrides):
 def _real_execution(**overrides):
     """Shaped like a real production fill -- order_id/market_slug/side/
     quoted_price nested under execution["order"], confirmed against actual
-    fills.json data on 2026-07-06."""
+    fills.json data on 2026-07-06. commissionNotionalCollected/outcomeSide/
+    marketMetadata.outcome confirmed present on 100% of real fills sampled
+    for the P&L-attribution feature (see live/lot_accounting.py)."""
     execution = {
         "id": "B32HEA83J5YV",
         "tradeId": "B32HEA83E5YV",
@@ -70,6 +79,7 @@ def _real_execution(**overrides):
         "lastPx": {"currency": "USD", "value": "0.6400"},
         "lastShares": "2.0000",
         "transactTime": "2026-07-06T14:20:32.560425954Z",
+        "commissionNotionalCollected": {"currency": "USD", "value": "-0.0200"},
         "order": {
             "id": "B308RJTX05Z9",
             "marketSlug": "aqc-fifa-wc-2026-07-07-quarterq-colbia",
@@ -77,6 +87,8 @@ def _real_execution(**overrides):
             "action": "ORDER_ACTION_BUY",
             "price": {"currency": "USD", "value": "0.64"},
             "quantity": 17.5,
+            "outcomeSide": "OUTCOME_SIDE_YES",
+            "marketMetadata": {"outcome": "Yes", "eventSlug": "fifa-wc-2026-07-07-quarterq"},
         },
     }
     execution.update(overrides)
@@ -116,6 +128,43 @@ class TestFillsPersistence:
 
     def test_get_all_fills_default_empty_when_file_missing(self, isolated_fills):
         assert get_all_fills() == []
+
+
+class TestBackfillResolvedOrders:
+    """multi_market_maker.py's execution-backfill mechanism's "confirmed
+    nothing to backfill" determinations, persisted so a bot restart doesn't
+    re-query the same long-resolved orders forever."""
+
+    def test_empty_when_no_file(self, isolated_fills):
+        assert get_backfill_resolved_order_ids() == set()
+
+    def test_round_trip(self, isolated_fills):
+        record_backfill_resolved("o1", "no_fill")
+        record_backfill_resolved("o2", "not_found")
+        assert get_backfill_resolved_order_ids() == {"o1", "o2"}
+
+    def test_appends_rather_than_overwrites(self, isolated_fills):
+        record_backfill_resolved("o1", "no_fill")
+        record_backfill_resolved("o2", "no_fill")
+        records = storage.load_json(fills_module.BACKFILL_RESOLVED_FILE, default=[])
+        assert [r["order_id"] for r in records] == ["o1", "o2"]
+
+    def test_records_the_reason_and_a_timestamp(self, isolated_fills):
+        record_backfill_resolved("o1", "not_found")
+        records = storage.load_json(fills_module.BACKFILL_RESOLVED_FILE, default=[])
+        assert records[0]["order_id"] == "o1"
+        assert records[0]["reason"] == "not_found"
+        assert records[0]["resolved_at"]
+
+    def test_fails_closed_on_corrupt_file(self, isolated_fills, caplog):
+        fills_module.BACKFILL_RESOLVED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fills_module.BACKFILL_RESOLVED_FILE.write_text("{not valid json", encoding="utf-8")
+
+        with caplog.at_level("ERROR"):
+            ids = get_backfill_resolved_order_ids()
+
+        assert ids == set()
+        assert any("backfill" in r.message.lower() for r in caplog.records)
 
 
 class TestBuildFillRecord:
@@ -271,6 +320,33 @@ class TestBuildFillRecord:
         assert record.side == "BUY"
         assert record.quoted_price == pytest.approx(0.44)
 
+    def test_extracts_commission_usd_from_real_nested_schema(self):
+        record = build_fill_record(_real_execution(), order_details={}, current_bbo=None)
+        assert record.commission_usd == pytest.approx(-0.02)  # negative = maker rebate earned
+
+    def test_extracts_outcome_from_order_outcome_side(self):
+        record = build_fill_record(_real_execution(), order_details={}, current_bbo=None)
+        assert record.outcome == "YES"
+
+    def test_outcome_side_no_normalizes_correctly(self):
+        execution = _real_execution(order={
+            **_real_execution()["order"], "outcomeSide": "OUTCOME_SIDE_NO",
+        })
+        record = build_fill_record(execution, order_details={}, current_bbo=None)
+        assert record.outcome == "NO"
+
+    def test_outcome_falls_back_to_market_metadata_when_outcome_side_absent(self):
+        order = {**_real_execution()["order"], "marketMetadata": {"outcome": "No"}}
+        del order["outcomeSide"]
+        execution = _real_execution(order=order)
+        record = build_fill_record(execution, order_details={}, current_bbo=None)
+        assert record.outcome == "NO"
+
+    def test_outcome_and_commission_none_when_absent(self):
+        record = build_fill_record(_execution(), order_details={}, current_bbo=None)
+        assert record.outcome is None
+        assert record.commission_usd is None
+
 
 class TestIsActualFill:
     def test_true_for_fill_and_partial_fill(self):
@@ -337,11 +413,30 @@ class TestMigrateLegacyFills:
         assert migrated[0]["markout_1m_computed_at"] == "2026-07-06T14:21:32+00:00"
         assert migrated[0]["markout_5m_cents"] is None
 
+    def test_preserves_existing_markout_15m_field(self):
+        existing = [{
+            "raw_execution": _real_execution(),
+            "markout_15m_cents": -1.5,
+            "markout_15m_computed_at": "2026-07-06T14:35:32+00:00",
+        }]
+        migrated, _stats = migrate_legacy_fills(existing, order_details={})
+        assert migrated[0]["markout_15m_cents"] == -1.5
+        assert migrated[0]["markout_15m_computed_at"] == "2026-07-06T14:35:32+00:00"
+
     def test_skips_records_with_missing_or_malformed_raw_execution(self):
         existing = [{"raw_execution": "not-a-dict"}, {}]
         migrated, stats = migrate_legacy_fills(existing, order_details={})
         assert migrated == []
         assert stats["dropped_non_fill"] == 2
+
+    def test_backfills_outcome_and_commission_onto_legacy_records(self):
+        # A record written before outcome/commission_usd existed -- neither
+        # top-level key is present, but raw_execution (always preserved
+        # verbatim) still has the real data to re-derive them from.
+        existing = [{"raw_execution": _real_execution()}]
+        migrated, _stats = migrate_legacy_fills(existing, order_details={})
+        assert migrated[0]["outcome"] == "YES"
+        assert migrated[0]["commission_usd"] == pytest.approx(-0.02)
 
     def test_end_to_end_against_realistic_shape(self):
         # 3 noise + 1 real fill, mirroring the real file's proportions.
@@ -434,9 +529,33 @@ class TestFindDueMarkoutWindows:
         assert windows["5m"]["status"] == "stale"
 
     def test_already_resolved_window_skipped(self):
-        fill = _due_fill(markout_1m_computed_at="2026-07-06T12:01:05+00:00", markout_5m_computed_at="2026-07-06T12:05:05+00:00")
+        fill = _due_fill(
+            markout_1m_computed_at="2026-07-06T12:01:05+00:00",
+            markout_5m_computed_at="2026-07-06T12:05:05+00:00",
+            markout_15m_computed_at="2026-07-06T12:15:05+00:00",
+        )
         due = find_due_markout_windows([fill], now=self._now(hours=2), max_staleness_seconds=900.0)
         assert due == []
+
+    def test_due_and_computable_15m(self):
+        due = find_due_markout_windows(
+            [_due_fill(
+                markout_1m_computed_at="2026-07-06T12:01:05+00:00",
+                markout_5m_computed_at="2026-07-06T12:05:05+00:00",
+            )],
+            now=self._now(seconds=905), max_staleness_seconds=900.0,
+        )
+        windows = {d["window"]: d for d in due}
+        assert windows["15m"]["status"] == "compute"
+
+    def test_windows_override_parameter(self):
+        due = find_due_markout_windows(
+            [_due_fill()], now=self._now(seconds=125), max_staleness_seconds=900.0,
+            windows=(("2m", 120.0),),
+        )
+        windows = {d["window"]: d for d in due}
+        assert windows["2m"]["status"] == "compute"
+        assert "1m" not in windows  # not in the override tuple, never checked
 
     def test_skips_fill_missing_transact_time(self):
         due = find_due_markout_windows([_due_fill(transact_time=None)], now=self._now(hours=1), max_staleness_seconds=900.0)

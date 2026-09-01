@@ -24,6 +24,7 @@ much capital is currently reserved for resting orders.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from .. import config, storage
@@ -91,13 +92,17 @@ def get_known_order_id_markets() -> dict[str, str]:
 
 def get_known_order_details() -> dict[str, dict]:
     """Every order id this bot has ever recorded posting, mapped to
-    {"market_id", "side", "price"} -- the market slug, BUY/SELL, and the
-    bot's own intended quote price at post time, for that order. One walk
-    of get_all_cycles() underlies get_known_order_id_markets()/
-    get_known_order_ids() too (rebuilt on top of this), and live/fills.py
-    uses it to enrich a detected fill with the side/market/intended-price it
-    can't reliably get from the private-WS execution message alone (see
-    live/RUNBOOK.md's "-9." section).
+    {"market_id", "side", "price", "size"} -- the market slug, BUY/SELL,
+    the bot's own intended quote price, and order size at post time, for
+    that order. One walk of get_all_cycles() underlies
+    get_known_order_id_markets()/get_known_order_ids() too (rebuilt on top
+    of this), and live/fills.py uses it to enrich a detected fill with the
+    side/market/intended-price it can't reliably get from the private-WS
+    execution message alone (see live/RUNBOOK.md's "-9." section).
+    live/event_exposure.py's resting-order projection uses "size" (added
+    for that feature) to compute a still-open order's worst-case USD
+    without ever needing to parse the exchange's own open-order response
+    schema, which has never been verified beyond id/marketSlug.
 
     Same fail-closed contract as get_known_order_ids(): returns {} (not a
     partial result) on any read/parse failure, logging loudly rather than
@@ -117,6 +122,7 @@ def get_known_order_details() -> dict[str, dict]:
                         "market_id": market_id,
                         "side": leg.get("side"),
                         "price": leg.get("price"),
+                        "size": leg.get("size"),
                     }
         return order_details
     except Exception as exc:  # noqa: BLE001 -- local-state read must never crash a cycle
@@ -129,23 +135,66 @@ def get_known_order_details() -> dict[str, dict]:
 
 
 def get_total_position_pnl_usd(client: LiveUsClient) -> Optional[float]:
-    """Cumulative, non-resetting P/L (unrealized + realized, summed across
-    every currently held position) right now. Unlike estimate_daily_pnl_usd,
+    """Cumulative strategy P/L from current positions and tracked closed lots.
+
+    Unlike estimate_daily_pnl_usd,
     this is NOT diffed against a UTC-midnight baseline -- live/
     equity_protection.py's lifetime/session peak-account-value check needs a
     figure that doesn't reset every day the way the daily-loss circuit
-    breaker deliberately does. Returns None if positions can't be fetched.
-
-    Known gap (shared with estimate_daily_pnl_usd, which this now backs): a
-    position that fully closes to flat may drop out of get_all_positions()
-    before its final realized P/L is captured this way -- a known, smaller
-    gap than the balance-field noise this replaced."""
+    breaker deliberately does. Returns None if positions or local closed-lot
+    state cannot be established."""
     try:
         positions = client.get_all_positions()
     except UsApiError as exc:
         logger.warning("Could not fetch positions for P/L estimate: %s", exc)
         return None
-    return round(sum_position_pnl(positions), 4)
+    return strategy_total_pnl_usd(positions)
+
+
+def strategy_total_pnl_usd(positions: dict) -> Optional[float]:
+    """Current-position P/L plus tracked P/L from fully closed markets.
+
+    The positions endpoint drops a market once it is flat. Without the
+    closed-lot component, realizing a loss could make the breaker metric
+    jump upward and effectively erase the loss. For markets still present,
+    the exchange ``realized`` field remains authoritative so partial closes
+    are not double-counted.
+    """
+    total = sum_position_pnl(positions)
+    try:
+        from .fills import get_all_fills
+        from .lot_accounting import compute_lots
+        from .settlements import get_all_settlements, get_earliest_snapshot_by_slug
+
+        closed_lots = compute_lots(
+            get_all_fills(), get_all_settlements(), get_earliest_snapshot_by_slug(),
+        ).closed_lots
+    except Exception as exc:  # noqa: BLE001 -- unknown breaker state must fail closed upstream
+        logger.error("Could not include closed lots in strategy P/L: %s", exc)
+        return None
+
+    active_slugs = set(positions)
+    total += sum(
+        lot.net_pnl_usd for lot in closed_lots if lot.market_slug not in active_slugs
+    )
+    return round(total, 4)
+
+
+def diff_against_baseline(total_now: float, baseline_file: Path) -> float:
+    """Diffs total_now against a UTC-day-scoped baseline persisted in
+    baseline_file, resetting the baseline whenever the stored date doesn't
+    match today. Extracted from estimate_daily_pnl_usd so a caller that
+    already has total_now (e.g. ws_runner.py, deriving both the daily AND
+    session P/L figures from one get_total_position_pnl_usd() fetch) doesn't
+    need to fetch positions a second time."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    state = storage.load_json(baseline_file, default={})
+    metric_version = 2
+    if state.get("date") != today or state.get("metric_version") != metric_version:
+        state = {"date": today, "baseline": total_now, "metric_version": metric_version}
+        storage.save_json(baseline_file, state)
+
+    return round(total_now - state["baseline"], 4)
 
 
 def estimate_daily_pnl_usd(client: LiveUsClient) -> Optional[float]:
@@ -155,14 +204,7 @@ def estimate_daily_pnl_usd(client: LiveUsClient) -> Optional[float]:
     total_now = get_total_position_pnl_usd(client)
     if total_now is None:
         return None
-
-    today = datetime.now(timezone.utc).date().isoformat()
-    state = storage.load_json(DAILY_BALANCE_FILE, default={})
-    if state.get("date") != today:
-        state = {"date": today, "baseline": total_now}
-        storage.save_json(DAILY_BALANCE_FILE, state)
-
-    return round(total_now - state["baseline"], 4)
+    return diff_against_baseline(total_now, DAILY_BALANCE_FILE)
 
 
 def sum_position_pnl(positions: dict) -> float:

@@ -23,11 +23,12 @@ on top of.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from .. import config, storage
 from ..logger import get_logger
 from ..models import utcnow_iso
+from .cancel_safeguard import cancel_all_and_verify
 from .ledger import get_total_position_pnl_usd
 from .us_client import LiveUsClient
 
@@ -44,7 +45,13 @@ class EquityProtection:
         state = storage.load_json(STATE_FILE, default={})
         return bool(state.get("halted", False))
 
-    def evaluate(self, total_pnl_usd: float, client: LiveUsClient) -> tuple[bool, float]:
+    def evaluate(
+        self,
+        total_pnl_usd: float,
+        client: LiveUsClient,
+        lifetime_pnl_usd: Optional[float] = None,
+        open_orders: Optional[list[dict[str, Any]]] = None,
+    ) -> tuple[bool, float]:
         """Returns (halted, size_multiplier_for_this_cycle). `total_pnl_usd`
         is the DAILY-resetting figure (same one the circuit breaker uses) --
         used only for the same-day profit-lock sizing check. The
@@ -56,6 +63,11 @@ class EquityProtection:
 
         state = storage.load_json(STATE_FILE, default={})
         if state.get("halted", False):
+            cancel_all_and_verify(
+                client,
+                open_orders=open_orders,
+                context="equity protection already halted",
+            )
             return True, 1.0
 
         today = datetime.now(timezone.utc).date().isoformat()
@@ -74,15 +86,28 @@ class EquityProtection:
         )
 
         if self.settings.starting_capital_usd > 0:
-            total_position_pnl = get_total_position_pnl_usd(client)
+            total_position_pnl = (
+                lifetime_pnl_usd
+                if lifetime_pnl_usd is not None
+                else get_total_position_pnl_usd(client)
+            )
             if total_position_pnl is None:
-                logger.warning(
-                    "Could not fetch positions for the equity-protection "
-                    "drawdown check -- skipping it this cycle (failing "
-                    "open), trading continues."
+                logger.error(
+                    "Could not establish lifetime P/L for the equity-protection "
+                    "drawdown check; cancelling orders and failing closed this cycle."
                 )
+                cancel_all_and_verify(
+                    client,
+                    open_orders=open_orders,
+                    context="equity-protection P/L unavailable",
+                )
+                return True, 1.0
             else:
                 account_value = self.settings.starting_capital_usd + total_position_pnl
+                metric_version = 2
+                if state.get("peak_metric_version") != metric_version:
+                    state.pop("peak_account_value_usd", None)
+                    state["peak_metric_version"] = metric_version
                 peak = state.get("peak_account_value_usd", account_value)  # bootstrap
                 peak = max(peak, account_value)
                 state["peak_account_value_usd"] = peak
@@ -94,7 +119,6 @@ class EquityProtection:
                         "resting orders and halting.",
                         account_value, threshold, peak,
                     )
-                    client.cancel_all()
                     state["halted"] = True
                     state["halted_at"] = utcnow_iso()
                     state["halted_reason"] = (
@@ -102,6 +126,11 @@ class EquityProtection:
                         f"${threshold:.2f} (peak ${peak:.2f})"
                     )
                     storage.save_json(STATE_FILE, state)
+                    cancel_all_and_verify(
+                        client,
+                        open_orders=open_orders,
+                        context="equity-protection drawdown trip",
+                    )
                     return True, 1.0
         elif not state.get("starting_capital_warned"):
             logger.warning(

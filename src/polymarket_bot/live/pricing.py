@@ -108,7 +108,7 @@ def compute_book_aware_quote(
     max_price = min(1 - tick_size, 0.99)
 
     new_bid = round_to_tick(max(min(best_bid + tick_size, max_price), min_price), tick_size)
-    new_ask = round_to_tick(max(best_ask - tick_size, min_price), tick_size)
+    new_ask = round_to_tick(max(min(best_ask - tick_size, max_price), min_price), tick_size)
 
     captured_spread = new_ask - new_bid
     min_edge = min_edge_cents / 100
@@ -116,6 +116,39 @@ def compute_book_aware_quote(
         return None
 
     return QuoteSides(bid=new_bid, ask=new_ask)
+
+
+def book_has_enough_depth(book: dict, settings) -> bool:
+    """Apply the exact live L2 depth guard to a normalized book.
+
+    Observation uses this same helper so a hypothetical fill from a book
+    the real maker would reject cannot qualify a market for live entry.
+    """
+    levels = max(1, settings.depth_levels_to_check)
+    bids = list(book.get("bids") or [])
+    asks = list(book.get("asks") or [])
+    if not bids or not asks:
+        return False
+
+    def quantity(level: dict) -> float:
+        try:
+            value = level.get("quantity", 0.0)
+            if isinstance(value, dict):
+                value = value.get("value", 0.0)
+            return max(0.0, float(value))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    if quantity(bids[0]) < settings.min_top_depth_shares:
+        return False
+    if quantity(asks[0]) < settings.min_top_depth_shares:
+        return False
+    return (
+        sum(quantity(level) for level in bids[:levels])
+        >= settings.min_total_depth_shares
+        and sum(quantity(level) for level in asks[:levels])
+        >= settings.min_total_depth_shares
+    )
 
 
 def apply_cost_basis_floor(
@@ -142,6 +175,44 @@ def apply_cost_basis_floor(
         adjusted = max(exit_price, _ceil_to_tick(avg_cost, tick_size))
     else:
         adjusted = min(exit_price, _floor_to_tick(avg_cost, tick_size))
+
+    if not (max(tick_size, 0.01) <= adjusted <= min(1 - tick_size, 0.99)):
+        return None
+    return adjusted
+
+
+def apply_liquidation_limit(
+    exit_price: float,
+    net_position: float,
+    avg_cost: Optional[float],
+    tick_size: float,
+    allowed_loss_cents: float,
+    max_total_loss_usd: float,
+) -> Optional[float]:
+    """Bound, but do not prohibit, a reducing order's realized loss.
+
+    ``allowed_loss_cents`` is supplied by the time/risk policy in
+    ``MarketMaker``. The total-dollar cap prevents a large position from
+    consuming the same per-share allowance as a small one. Rounding is
+    conservative: a long's minimum exit rounds up and a short's maximum
+    cover price rounds down.
+    """
+    if avg_cost is None or net_position == 0:
+        return exit_price
+
+    per_share_limit = max(0.0, allowed_loss_cents) / 100.0
+    if max_total_loss_usd >= 0:
+        per_share_limit = min(
+            per_share_limit,
+            max_total_loss_usd / abs(net_position) if net_position else 0.0,
+        )
+
+    if net_position > 0:
+        minimum_exit = _ceil_to_tick(avg_cost - per_share_limit, tick_size)
+        adjusted = max(exit_price, minimum_exit)
+    else:
+        maximum_exit = _floor_to_tick(avg_cost + per_share_limit, tick_size)
+        adjusted = min(exit_price, maximum_exit)
 
     if not (max(tick_size, 0.01) <= adjusted <= min(1 - tick_size, 0.99)):
         return None

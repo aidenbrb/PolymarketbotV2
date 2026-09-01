@@ -1,4 +1,7 @@
-from polymarket_bot.live.reconciliation import reconcile
+import pytest
+
+from polymarket_bot.live.lot_accounting import ClosedLot
+from polymarket_bot.live.reconciliation import reconcile, reconcile_realized_pnl
 
 
 def _order(order_id=None, order_id_alt=None, slug=None, slug_alt=None):
@@ -186,3 +189,82 @@ def test_combined_scenario_exercises_all_report_facets():
     assert report.open_order_count == 3
     assert report.position_count == 3
     assert report.ledger_appears_empty is False
+
+
+def _closed_lot(market_slug="m1", net_pnl_usd=1.0):
+    return ClosedLot(
+        lot_id="lot1", market_slug=market_slug, outcome="YES", event_bucket_key=None,
+        open_fill_id="f1", open_order_id="o1", open_side="BUY", open_price=0.40,
+        open_time="2026-07-06T14:00:00+00:00", close_fill_id="f2", close_order_id="o2",
+        close_price=0.50, close_time="2026-07-06T15:00:00+00:00", closed_via="fill",
+        shares_matched=10.0, gross_pnl_usd=net_pnl_usd, open_commission_usd=0.0,
+        close_commission_usd=0.0, net_pnl_usd=net_pnl_usd, holding_seconds=3600.0,
+    )
+
+
+class TestReconcileRealizedPnl:
+    def test_within_tolerance_when_figures_closely_agree(self):
+        closed_lots = [_closed_lot(market_slug="m1", net_pnl_usd=1.00)]
+        snapshots = {"m1": {"realized_usd": 1.02}}
+
+        reports = reconcile_realized_pnl(closed_lots, snapshots, tolerance_usd=0.05)
+
+        assert len(reports) == 1
+        assert reports[0].strategy_a_realized_usd == pytest.approx(1.00)
+        assert reports[0].strategy_b_realized_usd == pytest.approx(1.02)
+        assert reports[0].delta_usd == pytest.approx(-0.02)
+        assert reports[0].within_tolerance is True
+
+    def test_flags_a_real_mismatch_beyond_tolerance(self):
+        closed_lots = [_closed_lot(market_slug="m1", net_pnl_usd=1.00)]
+        snapshots = {"m1": {"realized_usd": 5.00}}
+
+        reports = reconcile_realized_pnl(closed_lots, snapshots, tolerance_usd=0.05)
+
+        assert reports[0].delta_usd == pytest.approx(-4.00)
+        assert reports[0].within_tolerance is False
+
+    def test_sums_across_both_outcomes_for_the_same_slug(self):
+        closed_lots = [
+            _closed_lot(market_slug="m1", net_pnl_usd=1.00),
+            ClosedLot(
+                lot_id="lot2", market_slug="m1", outcome="NO", event_bucket_key=None,
+                open_fill_id="f3", open_order_id="o3", open_side="BUY", open_price=0.30,
+                open_time="2026-07-06T14:00:00+00:00", close_fill_id="f4", close_order_id="o4",
+                close_price=0.35, close_time="2026-07-06T15:00:00+00:00", closed_via="fill",
+                shares_matched=10.0, gross_pnl_usd=0.50, open_commission_usd=0.0,
+                close_commission_usd=0.0, net_pnl_usd=0.50, holding_seconds=3600.0,
+            ),
+        ]
+        snapshots = {"m1": {"realized_usd": 1.50}}
+
+        reports = reconcile_realized_pnl(closed_lots, snapshots, tolerance_usd=0.05)
+
+        assert len(reports) == 1  # one report per slug, not per outcome
+        assert reports[0].strategy_a_realized_usd == pytest.approx(1.50)  # 1.00 + 0.50
+        assert reports[0].lot_count == 2
+        assert reports[0].within_tolerance is True
+
+    def test_missing_snapshot_reported_with_note_not_crashed(self):
+        closed_lots = [_closed_lot(market_slug="m1", net_pnl_usd=1.00)]
+
+        reports = reconcile_realized_pnl(closed_lots, latest_snapshot_by_slug={}, tolerance_usd=0.05)
+
+        assert reports[0].strategy_b_realized_usd is None
+        assert reports[0].delta_usd is None
+        assert reports[0].within_tolerance is False
+        assert reports[0].note is not None
+
+    def test_worst_mismatch_sorted_first(self):
+        closed_lots = [
+            _closed_lot(market_slug="small-diff", net_pnl_usd=1.00),
+            _closed_lot(market_slug="big-diff", net_pnl_usd=1.00),
+        ]
+        snapshots = {
+            "small-diff": {"realized_usd": 1.01},
+            "big-diff": {"realized_usd": 10.0},
+        }
+
+        reports = reconcile_realized_pnl(closed_lots, snapshots, tolerance_usd=0.05)
+
+        assert reports[0].market_slug == "big-diff"

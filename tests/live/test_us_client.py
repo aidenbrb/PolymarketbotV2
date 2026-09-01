@@ -1,12 +1,15 @@
 import base64
 import json
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
+import pytest
 import responses
 
 from polymarket_bot import config
+from polymarket_bot.live import us_client as us_client_module
 from polymarket_bot.live.credentials import ApiCredentials
-from polymarket_bot.live.us_client import LiveUsClient, UsApiError
+from polymarket_bot.live.us_client import LiveUsClient, UsApiError, is_client_rejection
 
 VALID_SECRET = base64.b64encode(b"a" * 32).decode()
 CREDS = ApiCredentials(key_id="key-123", secret_key=VALID_SECRET)
@@ -117,6 +120,67 @@ def test_get_position_signs_the_bare_path_without_query_string():
 
 
 @responses.activate
+def test_get_order_returns_full_terminal_order_state():
+    # Real response shape (confirmed 2026-07-19 against a real order): a
+    # GetOrderResponse wrapping the order in an {"order": {...}} envelope --
+    # NOT the bare order object.
+    settings = _settings()
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/order/o1",
+        json={"order": {
+            "id": "o1", "marketSlug": "m1", "state": "ORDER_STATE_FILLED",
+            "cumQuantity": "5.0", "avgPx": {"value": "0.45", "currency": "USD"},
+            "commissionNotionalTotalCollected": {"value": "0.02", "currency": "USD"},
+        }},
+        status=200,
+    )
+    order = _client(settings).get_order("o1")
+    assert order["state"] == "ORDER_STATE_FILLED"
+    assert order["cumQuantity"] == "5.0"
+    assert order["avgPx"]["value"] == "0.45"
+
+
+@responses.activate
+def test_get_order_returns_none_when_envelope_is_malformed():
+    settings = _settings()
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/order/o1",
+        json={"unexpected": "shape"}, status=200,
+    )
+    assert _client(settings).get_order("o1") is None
+
+
+@responses.activate
+def test_get_order_returns_none_on_404_not_found():
+    settings = _settings(request_max_retries=1)  # a 404 will never succeed -- no need to retry it here
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/order/missing", status=404)
+    assert _client(settings).get_order("missing") is None
+
+
+@responses.activate
+def test_get_order_still_raises_on_a_non_404_failure(monkeypatch):
+    monkeypatch.setattr(us_client_module.time, "sleep", Mock())
+    settings = _settings(request_max_retries=1)
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/order/o1", status=500)
+    with pytest.raises(UsApiError):
+        _client(settings).get_order("o1")
+
+
+@responses.activate
+def test_get_order_retries_on_429_then_succeeds(monkeypatch):
+    monkeypatch.setattr(us_client_module.time, "sleep", Mock())
+    settings = _settings(request_max_retries=3)
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/order/o1", status=429)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/order/o1",
+        json={"order": {"id": "o1", "state": "ORDER_STATE_CANCELED"}}, status=200,
+    )
+    order = _client(settings).get_order("o1")
+    assert order["state"] == "ORDER_STATE_CANCELED"
+    assert len(responses.calls) == 2
+
+
+@responses.activate
 def test_get_all_positions_returns_full_positions_dict():
     settings = _settings()
     responses.add(
@@ -146,17 +210,32 @@ def test_get_all_positions_returns_empty_dict_when_none_held():
 
 
 @responses.activate
-def test_get_all_positions_warns_when_more_pages_exist(caplog):
+def test_get_all_positions_follows_cursor_pagination():
     settings = _settings()
     responses.add(
         responses.GET, f"{settings.api_base_url}/v1/portfolio/positions",
         json={"positions": {"m1": {"netPositionDecimal": "5.0"}}, "eof": False, "nextCursor": "abc"},
         status=200,
     )
-    with caplog.at_level("WARNING"):
-        positions = _client(settings).get_all_positions()
-    assert "m1" in positions
-    assert any("paginated" in r.message.lower() or "more pages" in r.message.lower() for r in caplog.records)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/portfolio/positions",
+        json={"positions": {"m2": {"netPositionDecimal": "2.0"}}, "eof": True},
+        status=200,
+    )
+    positions = _client(settings).get_all_positions()
+    assert set(positions) == {"m1", "m2"}
+    assert parse_qs(urlparse(responses.calls[1].request.url).query) == {"cursor": ["abc"]}
+
+
+@responses.activate
+def test_get_all_positions_rejects_partial_page_without_cursor():
+    settings = _settings()
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/portfolio/positions",
+        json={"positions": {"m1": {}}, "eof": False}, status=200,
+    )
+    with pytest.raises(UsApiError, match="cursor"):
+        _client(settings).get_all_positions()
 
 
 @responses.activate
@@ -168,6 +247,25 @@ def test_get_open_orders_handles_orders_key():
     )
     orders = _client(settings).get_open_orders()
     assert orders == [{"id": "o1"}]
+
+
+@responses.activate
+def test_get_open_orders_follows_cursor_pagination():
+    settings = _settings()
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        json={"orders": [{"id": "o1"}], "eof": False, "nextCursor": "next"},
+        status=200,
+    )
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        json={"orders": [{"id": "o2"}], "eof": True}, status=200,
+    )
+
+    orders = _client(settings).get_open_orders()
+
+    assert [order["id"] for order in orders] == ["o1", "o2"]
+    assert parse_qs(urlparse(responses.calls[1].request.url).query) == {"cursor": ["next"]}
 
 
 @responses.activate
@@ -190,6 +288,85 @@ def test_create_order_sends_expected_body():
     assert body["action"] == "ORDER_ACTION_BUY"
     assert body["price"]["value"] == "0.490000"
     assert body["quantity"] == 100.0
+    assert body["participateDontInitiate"] is False
+
+
+@responses.activate
+def test_create_order_sends_participate_dont_initiate_when_requested():
+    settings = _settings()
+    responses.add(
+        responses.POST, f"{settings.api_base_url}/v1/orders",
+        json={"id": "order-1"}, status=200,
+    )
+    client = _client(settings)
+    client.create_order(
+        market_slug="m1", outcome_side="OUTCOME_SIDE_YES", action="ORDER_ACTION_BUY",
+        price=0.49, quantity=100.0, participate_dont_initiate=True,
+    )
+
+    body = json.loads(responses.calls[0].request.body)
+    assert body["participateDontInitiate"] is True
+
+
+class TestIsClientRejection:
+    """market_maker.py::_post_leg uses this to tell a definite, unambiguous
+    rejection (nothing was placed) apart from a genuinely uncertain
+    placement state -- see live/RUNBOOK.md's most recent section."""
+
+    @responses.activate
+    def test_true_for_a_definite_400(self):
+        settings = _settings(request_max_retries=1)
+        responses.add(
+            responses.POST, f"{settings.api_base_url}/v1/orders", status=400,
+        )
+        client = _client(settings)
+        with pytest.raises(UsApiError) as excinfo:
+            client.create_order(
+                market_slug="m1", outcome_side="OUTCOME_SIDE_YES", action="ORDER_ACTION_BUY",
+                price=0.49, quantity=100.0,
+            )
+
+        assert is_client_rejection(excinfo.value) is True
+
+    @responses.activate
+    def test_false_for_409_conflict_duplicate_order(self):
+        # Confirmed via docs.polymarket.us's error-handling reference: a
+        # 409 on order creation can mean "duplicate order with the same
+        # ClOrdID" -- genuinely ambiguous about whether an EARLIER attempt
+        # actually succeeded, unlike a clean 400/422/etc validation
+        # rejection. Must be treated as uncertain (like a 5xx), not a
+        # benign skip.
+        settings = _settings(request_max_retries=1)
+        responses.add(
+            responses.POST, f"{settings.api_base_url}/v1/orders", status=409,
+        )
+        client = _client(settings)
+        with pytest.raises(UsApiError) as excinfo:
+            client.create_order(
+                market_slug="m1", outcome_side="OUTCOME_SIDE_YES", action="ORDER_ACTION_BUY",
+                price=0.49, quantity=100.0,
+            )
+
+        assert is_client_rejection(excinfo.value) is False
+
+    @responses.activate
+    def test_false_for_a_5xx(self, monkeypatch):
+        monkeypatch.setattr(us_client_module.time, "sleep", Mock())
+        settings = _settings(request_max_retries=1)
+        responses.add(
+            responses.POST, f"{settings.api_base_url}/v1/orders", status=500,
+        )
+        client = _client(settings)
+        with pytest.raises(UsApiError) as excinfo:
+            client.create_order(
+                market_slug="m1", outcome_side="OUTCOME_SIDE_YES", action="ORDER_ACTION_BUY",
+                price=0.49, quantity=100.0,
+            )
+
+        assert is_client_rejection(excinfo.value) is False
+
+    def test_false_when_the_cause_carries_no_response(self):
+        assert is_client_rejection(UsApiError("no cause at all")) is False
 
 
 @responses.activate
@@ -248,6 +425,19 @@ def test_cancel_all_skips_orders_missing_fields_and_continues():
 
 
 @responses.activate
+def test_cancel_all_uses_supplied_snapshot_without_rest_read():
+    settings = _settings()
+    responses.add(
+        responses.POST, f"{settings.api_base_url}/v1/order/o1/cancel", json={}, status=200,
+    )
+
+    _client(settings).cancel_all(open_orders=[{"id": "o1", "marketSlug": "m1"}])
+
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.method == "POST"
+
+
+@responses.activate
 def test_request_failure_raises_us_api_error():
     settings = _settings()
     responses.add(responses.GET, f"{settings.api_base_url}/v1/whoami", status=500)
@@ -255,6 +445,137 @@ def test_request_failure_raises_us_api_error():
     import pytest
     with pytest.raises(UsApiError):
         client.whoami()
+
+
+@responses.activate
+def test_get_open_orders_retries_on_429_then_succeeds(monkeypatch):
+    monkeypatch.setattr(us_client_module.time, "sleep", Mock())
+    settings = _settings(request_max_retries=3)
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/orders/open", status=429)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        json={"orders": [{"id": "o1"}]}, status=200,
+    )
+    orders = _client(settings).get_open_orders()
+    assert orders == [{"id": "o1"}]
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_get_open_orders_exhausts_retries_and_raises_us_api_error(monkeypatch):
+    monkeypatch.setattr(us_client_module.time, "sleep", Mock())
+    settings = _settings(request_max_retries=3)
+    for _ in range(3):
+        responses.add(responses.GET, f"{settings.api_base_url}/v1/orders/open", status=429)
+    with pytest.raises(UsApiError):
+        _client(settings).get_open_orders()
+    assert len(responses.calls) == 3
+
+
+@responses.activate
+def test_retry_regenerates_signed_headers_per_attempt(monkeypatch):
+    monkeypatch.setattr(us_client_module.time, "sleep", Mock())
+    settings = _settings(request_max_retries=3)
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/orders/open", status=429)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        json={"orders": []}, status=200,
+    )
+    client = _client(settings)
+    spy = Mock(wraps=client._signed_headers)
+    client._signed_headers = spy
+
+    client.get_open_orders()
+
+    assert spy.call_count == 2
+
+
+@responses.activate
+def test_429_backs_off_harder_than_generic_error(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(us_client_module.time, "sleep", lambda s: sleeps.append(s))
+    settings = _settings(
+        request_max_retries=2, request_backoff_base_seconds=1.0, rate_limit_backoff_multiplier=4.0,
+    )
+
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/orders/open", status=429)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open", json={"orders": []}, status=200,
+    )
+    _client(settings).get_open_orders()
+    rate_limited_wait = sleeps[0]
+
+    responses.add(responses.GET, f"{settings.api_base_url}/v1/orders/open", status=503)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open", json={"orders": []}, status=200,
+    )
+    sleeps.clear()
+    _client(settings).get_open_orders()
+    generic_wait = sleeps[0]
+
+    assert rate_limited_wait == pytest.approx(generic_wait * 4.0)
+
+
+@responses.activate
+def test_retry_after_header_used_when_present(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(us_client_module.time, "sleep", lambda s: sleeps.append(s))
+    settings = _settings(request_max_retries=2)
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        status=429, headers={"Retry-After": "2.5"},
+    )
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open", json={"orders": []}, status=200,
+    )
+    _client(settings).get_open_orders()
+    assert sleeps == [2.5]
+
+
+@responses.activate
+def test_zero_retry_after_cannot_force_immediate_429_retry(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(us_client_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    settings = _settings(
+        request_max_retries=2,
+        request_backoff_base_seconds=1.0,
+        rate_limit_backoff_multiplier=4.0,
+    )
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        status=429, headers={"Retry-After": "0"},
+    )
+    responses.add(
+        responses.GET, f"{settings.api_base_url}/v1/orders/open",
+        json={"orders": []}, status=200,
+    )
+
+    _client(settings).get_open_orders()
+
+    assert sleeps == [4.0]
+
+
+@responses.activate
+def test_create_order_does_not_retry_on_429():
+    settings = _settings(request_max_retries=3)
+    responses.add(responses.POST, f"{settings.api_base_url}/v1/orders", status=429)
+    client = _client(settings)
+    with pytest.raises(UsApiError):
+        client.create_order(
+            market_slug="m1", outcome_side="OUTCOME_SIDE_YES", action="ORDER_ACTION_BUY",
+            price=0.49, quantity=100.0,
+        )
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_cancel_order_does_not_retry_on_429():
+    settings = _settings(request_max_retries=3)
+    responses.add(responses.POST, f"{settings.api_base_url}/v1/order/order-1/cancel", status=429)
+    client = _client(settings)
+    with pytest.raises(UsApiError):
+        client.cancel_order("order-1", "m1")
+    assert len(responses.calls) == 1
 
 
 def test_missing_cryptography_dependency_gives_friendly_error(monkeypatch):

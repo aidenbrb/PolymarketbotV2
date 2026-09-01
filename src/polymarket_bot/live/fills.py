@@ -37,10 +37,16 @@ from .models import FillRecord
 logger = get_logger("live.fills")
 
 FILLS_FILE = config.LIVE_TRADES_DIR / "fills.json"
+BACKFILL_RESOLVED_FILE = config.LIVE_TRADES_DIR / "backfill_resolved_orders.json"
 
 FILL_EXECUTION_TYPES = frozenset({"EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL"})
 _ORDER_SIDE_TO_CANONICAL = {"ORDER_SIDE_BUY": "BUY", "ORDER_SIDE_SELL": "SELL"}
-_MARKOUT_WINDOWS = (("1m", 60.0), ("5m", 300.0))
+# order.outcomeSide -> canonical "YES"/"NO". Confirmed to agree with
+# order.marketMetadata.outcome (the string fallback below) on 100% of real
+# fills checked -- see live/lot_accounting.py for why outcome is part of
+# true position identity.
+_OUTCOME_SIDE_TO_CANONICAL = {"OUTCOME_SIDE_YES": "YES", "OUTCOME_SIDE_NO": "NO"}
+_MARKOUT_WINDOWS = (("1m", 60.0), ("5m", 300.0), ("15m", 900.0))
 
 
 def get_all_fills() -> list[dict]:
@@ -75,6 +81,39 @@ def already_recorded_fill_ids() -> set[str]:
         return set()
 
 
+def get_backfill_resolved_order_ids() -> set[str]:
+    """The execution-backfill mechanism's "confirmed nothing to backfill"
+    determinations (multi_market_maker.py::_backfill_one_order), persisted
+    so a bot restart doesn't re-query the same long-resolved orders forever
+    -- read fresh each cycle, same fail-closed contract as
+    already_recorded_fill_ids()."""
+    try:
+        return {
+            r["order_id"] for r in storage.load_json(BACKFILL_RESOLVED_FILE, default=[])
+            if r.get("order_id")
+        }
+    except Exception as exc:  # noqa: BLE001 -- local-state read must never crash a cycle
+        logger.error(
+            "Could not read the backfill-resolved file to determine "
+            "already-resolved order ids -- treating as empty (an order may "
+            "be re-checked this cycle) rather than crashing: %s", exc,
+        )
+        return set()
+
+
+def record_backfill_resolved(order_id: str, reason: str) -> None:
+    """Persist why no future execution-backfill lookup is needed.
+
+    Reasons currently include ``no_fill`` (REST), ``not_found`` (REST),
+    and ``private_ws_no_fill`` (terminal private-stream update with an
+    explicit zero cumulative quantity).
+    """
+    storage.append_json_list(
+        BACKFILL_RESOLVED_FILE,
+        {"order_id": order_id, "reason": reason, "resolved_at": utcnow_iso()},
+    )
+
+
 def is_actual_fill(execution: dict[str, Any]) -> bool:
     """True only for an execution type where shares actually changed hands.
     NEW/CANCELED/REJECTED/etc are order-lifecycle noise, not fills, and must
@@ -99,6 +138,14 @@ def _nested(d: Any, *keys: str) -> Any:
 
 def _normalize_side(raw_side: Any) -> Optional[str]:
     return _ORDER_SIDE_TO_CANONICAL.get(raw_side)
+
+
+def _normalize_outcome(order: dict[str, Any]) -> Optional[str]:
+    canonical = _OUTCOME_SIDE_TO_CANONICAL.get(order.get("outcomeSide"))
+    if canonical is not None:
+        return canonical
+    fallback = _nested(order, "marketMetadata", "outcome")
+    return str(fallback).upper() if fallback else None
 
 
 def resolve_order_id_and_market_slug(
@@ -149,6 +196,8 @@ def build_fill_record(
     price = _to_float((execution.get("lastPx") or {}).get("value"))
     shares = _to_float(execution.get("lastShares"))
     transact_time = execution.get("transactTime")
+    outcome = _normalize_outcome(order)
+    commission_usd = _to_float(_nested(execution, "commissionNotionalCollected", "value"))
 
     current_mid_at_detection: Optional[float] = None
     edge_vs_current_mid_cents: Optional[float] = None
@@ -173,6 +222,8 @@ def build_fill_record(
         side=side,
         price=price,
         shares=shares,
+        outcome=outcome,
+        commission_usd=commission_usd,
         execution_type=execution.get("type", "UNKNOWN"),
         transact_time=transact_time,
         quoted_price=quoted_price,
@@ -183,8 +234,13 @@ def build_fill_record(
         markout_1m_computed_at=None,
         markout_5m_cents=None,
         markout_5m_computed_at=None,
+        markout_15m_cents=None,
+        markout_15m_computed_at=None,
         detected_at=utcnow_iso(),
         raw_execution=dict(execution),
+        executable_markout_1m_cents=None,
+        executable_markout_5m_cents=None,
+        executable_markout_15m_cents=None,
     )
 
 
@@ -216,6 +272,10 @@ def migrate_legacy_fills(
         for field_name in (
             "markout_1m_cents", "markout_1m_computed_at",
             "markout_5m_cents", "markout_5m_computed_at",
+            "markout_15m_cents", "markout_15m_computed_at",
+            "executable_markout_1m_cents",
+            "executable_markout_5m_cents",
+            "executable_markout_15m_cents",
         ):
             if raw_fill.get(field_name) is not None:
                 setattr(record, field_name, raw_fill[field_name])
@@ -248,15 +308,33 @@ def compute_markout_cents(side: str, fill_price: float, mid: float) -> float:
     return round(signed * 100, 4)
 
 
+def compute_executable_markout_cents(
+    side: str, fill_price: float, best_bid: float, best_ask: float,
+) -> float:
+    """Signed edge of fill_price vs. the price actually achievable to close
+    the position right now, in cents: BUY marks against best_bid (what a
+    sell-to-close would fetch), SELL marks against best_ask (what a
+    buy-to-close would cost). Unlike compute_markout_cents's midpoint, this
+    is a price the position could actually transact at."""
+    reference = best_bid if side == "BUY" else best_ask
+    signed = (reference - fill_price) if side == "BUY" else (fill_price - reference)
+    return round(signed * 100, 4)
+
+
 def find_due_markout_windows(
-    fills: list[dict], now: datetime, max_staleness_seconds: float
+    fills: list[dict],
+    now: datetime,
+    max_staleness_seconds: float,
+    windows: tuple[tuple[str, float], ...] = _MARKOUT_WINDOWS,
 ) -> list[dict[str, Any]]:
     """Pure. One entry per (fill, window) pair not yet resolved whose mark
     has passed -- status "compute" (needs a fresh BBO fetch) or "stale"
     (passed too long ago; resolve to None rather than a misleading number
     computed against an unrelated-in-time market snapshot). Skips fills
     missing transact_time/market_slug/side/price, and windows already
-    resolved (their *_computed_at is not None)."""
+    resolved (their *_computed_at is not None). `windows` defaults to the
+    fixed module constant; ws_runner.py overrides the "15m" duration from a
+    settings value, everything else (including every test) uses the default."""
     due: list[dict[str, Any]] = []
     for index, fill in enumerate(fills):
         transact_time = parse_transact_time(fill.get("transact_time"))
@@ -267,7 +345,7 @@ def find_due_markout_windows(
             or fill.get("price") is None
         ):
             continue
-        for window, seconds in _MARKOUT_WINDOWS:
+        for window, seconds in windows:
             if fill.get(f"markout_{window}_computed_at") is not None:
                 continue
             due_at = transact_time + timedelta(seconds=seconds)

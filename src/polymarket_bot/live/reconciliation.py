@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from .lot_accounting import ClosedLot
+
 
 @dataclass
 class ReconciliationReport:
@@ -103,6 +105,69 @@ def reconcile(
         open_order_count=len(open_orders),
         position_count=len(positions),
         ledger_appears_empty=ledger_appears_empty,
+    )
+
+
+@dataclass
+class PnlReconciliationReport:
+    market_slug: str
+    strategy_a_realized_usd: float
+    strategy_b_realized_usd: Optional[float]
+    delta_usd: Optional[float]
+    within_tolerance: bool
+    lot_count: int
+    note: Optional[str]
+
+
+def reconcile_realized_pnl(
+    closed_lots: list[ClosedLot],
+    latest_snapshot_by_slug: dict[str, dict[str, Any]],
+    tolerance_usd: float = 0.05,
+) -> list[PnlReconciliationReport]:
+    """Cross-checks live/lot_accounting.py's fill-based realized P&L
+    ("Strategy A") per market_slug against live/settlements.py's latest
+    position-snapshot realized_usd figure for that slug ("Strategy B") --
+    same "compute the same fact two ways, surface disagreement" role this
+    module already plays for order ownership (see module docstring).
+
+    Strategy A is summed ACROSS BOTH outcomes per slug before comparing,
+    since Strategy B's source (get_all_positions()) is keyed by
+    market_slug only, not (market_slug, outcome) -- a real, confirmed
+    granularity mismatch, not a bug to fix here.
+
+    OPEN CAVEAT, not yet resolved: whether the exchange's own `realized`
+    position field is net of commission or gross of it is unverified (no
+    settled position has been reconciled against real data yet) --
+    tolerance_usd is kept generous for exactly this reason; both figures
+    are always shown side by side rather than asserting they must match
+    tightly."""
+    by_slug: dict[str, dict[str, Any]] = {}
+    for lot in closed_lots:
+        bucket = by_slug.setdefault(lot.market_slug, {"realized_usd": 0.0, "lot_count": 0})
+        bucket["realized_usd"] += lot.net_pnl_usd
+        bucket["lot_count"] += 1
+
+    reports = []
+    for slug, bucket in by_slug.items():
+        snapshot = latest_snapshot_by_slug.get(slug)
+        strategy_b_realized = snapshot.get("realized_usd") if snapshot else None
+        delta = (
+            bucket["realized_usd"] - strategy_b_realized
+            if strategy_b_realized is not None else None
+        )
+        reports.append(PnlReconciliationReport(
+            market_slug=slug,
+            strategy_a_realized_usd=bucket["realized_usd"],
+            strategy_b_realized_usd=strategy_b_realized,
+            delta_usd=delta,
+            within_tolerance=delta is not None and abs(delta) <= tolerance_usd,
+            lot_count=bucket["lot_count"],
+            note=None if snapshot is not None else "No position snapshot recorded for this market yet.",
+        ))
+    return sorted(
+        reports,
+        key=lambda r: abs(r.delta_usd) if r.delta_usd is not None else -1.0,
+        reverse=True,
     )
 
 

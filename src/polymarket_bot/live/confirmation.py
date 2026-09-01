@@ -1,10 +1,11 @@
 """The go-live confirmation gate.
 
-Isolated from argparse so it's directly unit-testable. live-start and
-live-reset-breaker must pass through here before any credential is ever
-loaded or any order is ever placed. There is no --yes/--force CLI flag
-anywhere that could satisfy this -- see main.py's argparse wiring and
-tests/test_no_live_orders.py, which asserts no such flag is ever added.
+Isolated from argparse so it's directly unit-testable. live-start, both
+live-pilot commands, and live-reset-breaker must pass through here before
+any credential is ever loaded or any order is ever placed. There is no
+--yes/--force CLI flag anywhere that could satisfy this -- see main.py's
+argparse wiring and tests/test_no_live_orders.py, which assert no such flag
+is ever added.
 
 The ONE exception is `settings.unattended_mode` (env var
 LIVE_UNATTENDED_MODE), which the user explicitly requested to enable

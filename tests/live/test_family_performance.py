@@ -69,11 +69,12 @@ def test_classify_family_empty_or_unparseable_slug_falls_back_to_other():
     assert classify_family(None) == "other"
 
 
-def _fill(slug, markout_1m=None, markout_5m=None, quality=None):
+def _fill(slug, markout_1m=None, markout_5m=None, markout_15m=None, quality=None):
     return {
         "market_slug": slug,
         "markout_1m_cents": markout_1m,
         "markout_5m_cents": markout_5m,
+        "markout_15m_cents": markout_15m,
         "fill_quality": quality,
     }
 
@@ -84,8 +85,14 @@ def test_compute_family_performance_empty_input():
 
 def test_compute_family_performance_groups_and_aggregates():
     fills = [
-        _fill("astatc-fwc-por-esp-2026-07-06-cor-all-gt10pt5", markout_1m=1.0, markout_5m=2.0, quality="favorable"),
-        _fill("astatc-fwc-por-esp-2026-07-06-cor-all-gt11pt5", markout_1m=-3.0, markout_5m=-1.0, quality="adverse"),
+        _fill(
+            "astatc-fwc-por-esp-2026-07-06-cor-all-gt10pt5",
+            markout_1m=1.0, markout_5m=2.0, markout_15m=3.0, quality="favorable",
+        ),
+        _fill(
+            "astatc-fwc-por-esp-2026-07-06-cor-all-gt11pt5",
+            markout_1m=-3.0, markout_5m=-1.0, markout_15m=-5.0, quality="adverse",
+        ),
         _fill("astatc-mlb-az-sd-2026-07-06-hr-ketmar-gte1", markout_1m=0.0, markout_5m=0.0, quality="neutral"),
     ]
 
@@ -96,6 +103,8 @@ def test_compute_family_performance_groups_and_aggregates():
     assert corners.avg_markout_1m_cents == -1.0  # mean(1.0, -3.0)
     assert corners.median_markout_1m_cents == -1.0
     assert corners.avg_markout_5m_cents == 0.5  # mean(2.0, -1.0)
+    assert corners.avg_markout_15m_cents == -1.0  # mean(3.0, -5.0)
+    assert corners.median_markout_15m_cents == -1.0
     assert corners.favorable_count == 1
     assert corners.adverse_count == 1
     assert corners.neutral_count == 0
@@ -104,12 +113,16 @@ def test_compute_family_performance_groups_and_aggregates():
     hr = performances["home_run_prop"]
     assert hr.fill_count == 1
     assert hr.neutral_count == 1
+    assert hr.avg_markout_15m_cents is None  # never provided for this fill
 
 
 def test_compute_family_performance_excludes_none_markout_from_average_but_counts_fill():
     fills = [
         _fill("astatc-mlb-az-sd-2026-07-06-hr-a-gte1", markout_1m=None, markout_5m=None, quality=None),
-        _fill("astatc-mlb-az-sd-2026-07-06-hr-b-gte1", markout_1m=4.0, markout_5m=None, quality="favorable"),
+        _fill(
+            "astatc-mlb-az-sd-2026-07-06-hr-b-gte1",
+            markout_1m=4.0, markout_5m=None, markout_15m=6.0, quality="favorable",
+        ),
     ]
 
     performances = {p.family: p for p in compute_family_performance(fills)}
@@ -118,5 +131,19 @@ def test_compute_family_performance_excludes_none_markout_from_average_but_count
     assert hr.fill_count == 2
     assert hr.avg_markout_1m_cents == 4.0  # only the non-None value counted
     assert hr.avg_markout_5m_cents is None  # both were None
+    assert hr.avg_markout_15m_cents == 6.0  # only the non-None value counted
     assert hr.unresolved_count == 1  # the fill with quality=None
     assert hr.favorable_count == 1
+
+
+def test_quality_counts_come_from_fixed_markout_not_legacy_fill_quality():
+    fills = [
+        _fill("astatc-mlb-az-sd-2026-07-06-hr-a-gte1", markout_1m=2.0, quality=None),
+        _fill("astatc-mlb-az-sd-2026-07-06-hr-b-gte1", markout_1m=-2.0, quality="favorable"),
+    ]
+
+    performance = compute_family_performance(fills)[0]
+
+    assert performance.favorable_count == 1
+    assert performance.adverse_count == 1
+    assert performance.unresolved_count == 0

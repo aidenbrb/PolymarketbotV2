@@ -151,3 +151,38 @@ def test_live_start_has_no_yes_or_force_flag():
         assert "yes" not in option_strings and "force" not in option_strings, (
             f"live-start must not define a --yes/--force-style flag, found: {action.option_strings}"
         )
+
+
+def test_july5_pilot_has_no_yes_or_force_flag():
+    """The qualification bypass is not a confirmation bypass."""
+    from polymarket_bot.main import build_parser
+
+    parser = build_parser()
+    pilot_subparser = None
+    for action in parser._subparsers._group_actions:
+        pilot_subparser = action.choices.get("live-pilot-start-july5")
+    assert pilot_subparser is not None, "live-pilot-start-july5 command not found"
+
+    for action in pilot_subparser._actions:
+        option_strings = " ".join(action.option_strings).lower()
+        assert "yes" not in option_strings and "force" not in option_strings, (
+            "live-pilot-start-july5 must not define a --yes/--force-style "
+            f"flag, found: {action.option_strings}"
+        )
+
+
+def test_observation_continuation_defaults_to_thirty_hours():
+    from polymarket_bot.main import build_parser
+
+    args = build_parser().parse_args(["live-observation-continue"])
+
+    assert args.command == "live-observation-continue"
+    assert args.hours == 30.0
+
+
+def test_observation_healthy_completion_command_is_explicit():
+    from polymarket_bot.main import build_parser
+
+    args = build_parser().parse_args(["live-observation-complete"])
+
+    assert args.command == "live-observation-complete"

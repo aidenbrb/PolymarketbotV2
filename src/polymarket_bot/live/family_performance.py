@@ -83,6 +83,8 @@ class FamilyPerformance:
     median_markout_1m_cents: Optional[float]
     avg_markout_5m_cents: Optional[float]
     median_markout_5m_cents: Optional[float]
+    avg_markout_15m_cents: Optional[float]
+    median_markout_15m_cents: Optional[float]
     favorable_count: int
     adverse_count: int
     neutral_count: int
@@ -113,14 +115,23 @@ def compute_family_performance(fills: list[dict[str, Any]]) -> list[FamilyPerfor
     for family, family_fills in by_family.items():
         markout_1m = _resolved_values(family_fills, "markout_1m_cents")
         markout_5m = _resolved_values(family_fills, "markout_5m_cents")
+        markout_15m = _resolved_values(family_fills, "markout_15m_cents")
         quality_counts = {"favorable": 0, "adverse": 0, "neutral": 0}
         unresolved_count = 0
         for fill in family_fills:
-            quality = fill.get("fill_quality")
-            if quality in quality_counts:
-                quality_counts[quality] += 1
-            else:
+            # This is a markout report. Legacy migration correctly cleared
+            # the variable-delay fill_quality snapshot, so classify from the
+            # fixed 1m markout instead of showing every historical fill as
+            # unresolved despite having a valid measured markout.
+            markout = fill.get("markout_1m_cents")
+            if markout is None:
                 unresolved_count += 1
+            elif float(markout) > 0.1:
+                quality_counts["favorable"] += 1
+            elif float(markout) < -0.1:
+                quality_counts["adverse"] += 1
+            else:
+                quality_counts["neutral"] += 1
 
         performances.append(FamilyPerformance(
             family=family,
@@ -129,6 +140,8 @@ def compute_family_performance(fills: list[dict[str, Any]]) -> list[FamilyPerfor
             median_markout_1m_cents=statistics.median(markout_1m) if markout_1m else None,
             avg_markout_5m_cents=statistics.mean(markout_5m) if markout_5m else None,
             median_markout_5m_cents=statistics.median(markout_5m) if markout_5m else None,
+            avg_markout_15m_cents=statistics.mean(markout_15m) if markout_15m else None,
+            median_markout_15m_cents=statistics.median(markout_15m) if markout_15m else None,
             favorable_count=quality_counts["favorable"],
             adverse_count=quality_counts["adverse"],
             neutral_count=quality_counts["neutral"],

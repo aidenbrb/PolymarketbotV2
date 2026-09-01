@@ -16,6 +16,15 @@ Live trading on Polymarket US (REAL MONEY -- see live/RUNBOOK.md first):
     python -m polymarket_bot.main live-event-exposure  (read-only, needs credentials)
     python -m polymarket_bot.main live-fills           (read-only, no credentials)
     python -m polymarket_bot.main live-family-performance (read-only, no credentials)
+    python -m polymarket_bot.main live-observation-report (read-only, no credentials)
+    python -m polymarket_bot.main live-observation-continue (one-time evidence continuation)
+    python -m polymarket_bot.main live-observation-complete (finish missing healthy-feed evidence)
+    python -m polymarket_bot.main live-observation-settle (settle shadow inventory on resolved markets)
+    python -m polymarket_bot.main live-observation-replay (read-only, no credentials, no network)
+    python -m polymarket_bot.main live-pilot-start     (guarded real-money pilot)
+    python -m polymarket_bot.main live-pilot-start-july5 (unqualified July 5-style real-money pilot)
+    python -m polymarket_bot.main live-pnl              (read-only, no credentials)
+    python -m polymarket_bot.main live-pnl-reconcile     (read-only, needs credentials)
     python -m polymarket_bot.main live-migrate-fills   (one-time maintenance, no credentials)
     python -m polymarket_bot.main live-cancel-all
     python -m polymarket_bot.main live-reset-breaker
@@ -29,7 +38,13 @@ live/credentials.py, live/confirmation.py, and live/RUNBOOK.md.
 from __future__ import annotations
 
 import argparse
+import copy
+import dataclasses
+import json
+import math
+import shutil
 import sys
+import time
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -295,6 +310,9 @@ def cmd_live_start(_args: argparse.Namespace) -> None:
     from .live.confirmation import LiveTradingNotConfirmed, require_live_confirmation
 
     settings = config.load_settings().live
+    if settings.observation_only_mode and not settings.use_websocket:
+        print("Observation-only mode requires LIVE_USE_WEBSOCKET=true; bot not started.")
+        return
     try:
         require_live_confirmation(settings)
     except LiveTradingNotConfirmed as exc:
@@ -323,12 +341,19 @@ def cmd_live_start(_args: argparse.Namespace) -> None:
         return
     if settings.use_websocket:
         bot = WebSocketLiveTradingBot(client=client, settings=settings)
-        print(
-            "Starting WebSocket-driven live quoting across the newest "
-            f"{settings.newest_market_scan_limit} markets, up to "
-            f"{settings.max_orders_per_cycle} orders per cycle. "
-            "Press Ctrl+C to stop and cancel all resting orders."
-        )
+        if settings.observation_only_mode:
+            print(
+                "Starting WebSocket observation-only mode across up to "
+                f"{settings.observation_universe_size} markets. No new positions "
+                "will be opened. Press Ctrl+C to stop."
+            )
+        else:
+            print(
+                "Starting WebSocket-driven live quoting across the newest "
+                f"{settings.newest_market_scan_limit} markets, up to "
+                f"{settings.max_orders_per_cycle} order legs per cycle. "
+                "Press Ctrl+C to stop and cancel all resting orders."
+            )
         try:
             bot.run_forever()
         except (WebSocketDependencyMissing, AlreadyRunningError) as exc:
@@ -340,13 +365,399 @@ def cmd_live_start(_args: argparse.Namespace) -> None:
     print(
         "Starting REST-polling live quoting across the newest "
         f"{settings.newest_market_scan_limit} markets, up to "
-        f"{settings.max_orders_per_cycle} orders per cycle. "
+        f"{settings.max_orders_per_cycle} order legs per cycle. "
         "Press Ctrl+C to stop and cancel all resting orders."
     )
     try:
         bot.run_forever()
     except AlreadyRunningError as exc:
         print(str(exc))
+
+
+def _guarded_pilot_settings(
+    base: config.LiveTradingSettings,
+) -> config.LiveTradingSettings:
+    """Return the fixed pilot envelope; environment tuning cannot widen it."""
+    return dataclasses.replace(
+        base,
+        observation_only_mode=False,
+        observation_gate_enabled=True,
+        pilot_mode=True,
+        use_websocket=True,
+        enable_private_websocket=True,
+        order_shares_min=1.0,
+        order_shares_max=1.0,
+        max_orders_per_cycle=10,
+        max_spread=0.50,
+        max_started_event_hours=3.0,
+        max_markets_per_event=3,
+        one_round_trip_per_market_per_session=False,
+        require_both_entry_legs=True,
+        flat_first_inventory_enabled=True,
+        pre_event_reduce_only_minutes=60.0,
+        hard_flatten_minutes_before_event=0.0,
+        hard_flatten_on_max_holding_enabled=True,
+        liquidation_max_holding_hours=1.0,
+        refresh_interval_seconds=60,
+        pilot_entry_hours=3.5,
+        pilot_drain_minutes=30.0,
+        pilot_max_round_trips_per_market=2,
+        fast_reprice_enabled=True,
+    )
+
+
+JULY5_PILOT_CONFIRMATION_PHRASE = (
+    "I UNDERSTAND THIS BYPASSES THE OBSERVATION QUALIFICATION GATE "
+    "AND PLACES REAL ORDERS WITH REAL MONEY"
+)
+
+
+def _guarded_july5_pilot_settings(
+    base: config.LiveTradingSettings,
+) -> config.LiveTradingSettings:
+    """Return the fixed, unqualified July 5-style pilot envelope.
+
+    This deliberately widens only the opportunity-set controls negotiated
+    for this command.  It inherits the guarded pilot's one-share sizing,
+    paired maker entries, holding limit, event cap, timed shutdown, and
+    verified-flat behavior.
+    """
+    guarded = _guarded_pilot_settings(base)
+    return dataclasses.replace(
+        guarded,
+        max_spread=0.98,
+        pre_event_reduce_only_minutes=0.0,
+        max_started_event_hours=6.0,
+        rank_by_expected_value=False,
+        observation_gate_enabled=False,
+        activity_tracking_enabled=True,
+        activity_rerank_enabled=False,
+        extreme_price_low_threshold=0.15,
+        extreme_price_high_threshold=0.85,
+        extreme_price_min_edge_cents=4.0,
+        max_payoff_loss_to_capture_ratio=20.0,
+        unattended_mode=False,
+        pilot_qualification_bypassed=True,
+        pilot_strategy_profile="july5_style",
+        confirmation_phrase=JULY5_PILOT_CONFIRMATION_PHRASE,
+    )
+
+
+def cmd_live_pilot_start(_args: argparse.Namespace) -> None:
+    """Start the fixed one-share, four-hour controlled live pilot."""
+    from .live.confirmation import LiveTradingNotConfirmed, require_live_confirmation
+    from .live.market_observation import PILOT_OBSERVATION_FILE, MarketObservationTracker
+
+    loaded = config.load_settings()
+    base = loaded.live
+    if not base.use_websocket or not base.enable_private_websocket:
+        print(
+            "Guarded live pilot is locked: LIVE_USE_WEBSOCKET and "
+            "LIVE_ENABLE_PRIVATE_WEBSOCKET must both already be enabled."
+        )
+        return
+    evidence = MarketObservationTracker(base)
+    allowed, reasons = evidence.pilot_start_eligible()
+    if not allowed:
+        print("Guarded live pilot is locked.")
+        for reason in reasons:
+            print(f"  - {reason}")
+        print("Run live-observation-report --profile controlled for the full gate.")
+        return
+
+    pilot = _guarded_pilot_settings(base)
+    try:
+        require_live_confirmation(pilot)
+    except LiveTradingNotConfirmed as exc:
+        print(f"Guarded live pilot not started: {exc}")
+        return
+
+    from .live.circuit_breaker import CircuitBreaker, SessionCircuitBreaker
+    from .live.credentials import MissingCredentialsError, load_api_credentials
+    from .live.equity_protection import EquityProtection
+    from .live.instance_lock import AlreadyRunningError
+    from .live.us_client import CryptographyDependencyMissing, LiveUsClient
+    from .live.ws_market_data import WebSocketDependencyMissing
+    from .live.ws_runner import PilotFlatnessError, WebSocketLiveTradingBot
+
+    try:
+        credentials = load_api_credentials()
+        client = LiveUsClient(credentials=credentials, settings=pilot)
+    except (MissingCredentialsError, CryptographyDependencyMissing) as exc:
+        print(f"Cannot start guarded live pilot: {exc}")
+        return
+
+    daily_settings = dataclasses.replace(
+        loaded.circuit_breaker,
+        enabled=True,
+        daily_loss_limit_usd=3.0,
+    )
+    session_settings = dataclasses.replace(
+        loaded.session_circuit_breaker,
+        enabled=True,
+        loss_limit_usd=3.0,
+    )
+    equity_settings = dataclasses.replace(
+        loaded.equity_protection,
+        profit_lock_size_multiplier=1.0,
+    )
+    daily_breaker = CircuitBreaker(daily_settings)
+    if daily_breaker.is_halted():
+        print(
+            "Guarded live pilot is locked because the daily circuit breaker "
+            "is already halted. Review the loss before resetting it."
+        )
+        return
+    bot = WebSocketLiveTradingBot(
+        client=client,
+        settings=pilot,
+        circuit_breaker=daily_breaker,
+        session_circuit_breaker=SessionCircuitBreaker(session_settings),
+        equity_protection=EquityProtection(equity_settings),
+        observation_tracker=MarketObservationTracker(pilot, path=PILOT_OBSERVATION_FILE),
+    )
+    print(
+        "Starting the guarded four-hour pilot: one share per leg, up to "
+        "10 legs/five markets, qualified cohorts only, $3 daily and session "
+        "loss limits. New entries stop after 3.5 hours; shutdown must verify flat."
+    )
+    try:
+        bot.run_forever()
+    except (
+        WebSocketDependencyMissing,
+        AlreadyRunningError,
+        PilotFlatnessError,
+    ) as exc:
+        print(str(exc))
+
+
+def cmd_live_pilot_start_july5(_args: argparse.Namespace) -> None:
+    """Start the fixed, unqualified July 5-style one-share live pilot."""
+    from .live.confirmation import LiveTradingNotConfirmed, require_live_confirmation
+    from .live.market_observation import (
+        JULY5_PILOT_OBSERVATION_FILE,
+        OBSERVATION_FILE,
+        PRIMARY_STRATEGY,
+        MarketObservationTracker,
+    )
+
+    loaded = config.load_settings()
+    base = loaded.live
+    if not base.use_websocket or not base.enable_private_websocket:
+        print(
+            "July 5-style live pilot is locked: LIVE_USE_WEBSOCKET and "
+            "LIVE_ENABLE_PRIVATE_WEBSOCKET must both already be enabled."
+        )
+        return
+
+    # Both evidence checks are informational for this explicitly unqualified
+    # command.  Failures, missing evidence, and negative evidence are shown,
+    # but none masquerades as a qualification pass or silently changes the
+    # negotiated bypass into an ordinary controlled pilot.
+    evidence = None
+    try:
+        evidence = MarketObservationTracker(base)
+        controlled_allowed, controlled_reasons = evidence.pilot_start_eligible()
+        print(
+            "Controlled observation gate (informational only): "
+            f"{'PASS' if controlled_allowed else 'NOT PASSED'}."
+        )
+        for reason in controlled_reasons:
+            print(f"  - {reason}")
+    except Exception as exc:  # noqa: BLE001 -- evidence is non-blocking here
+        print(f"Controlled observation gate unavailable (non-blocking): {exc}")
+
+    if OBSERVATION_FILE.exists():
+        try:
+            from .live.observation_replay import run_replay
+
+            replay = run_replay(OBSERVATION_FILE)
+            follow_up = (
+                replay.get("profiles", {})
+                .get("july5_style", {})
+                .get(PRIMARY_STRATEGY, {})
+                .get("follow_up", {})
+            )
+            status = follow_up.get("status", "UNAVAILABLE")
+            print(f"July 5-style shadow follow-up (informational only): {status}.")
+            for reason in follow_up.get("blocked_reasons", []):
+                print(f"  - {reason}")
+        except Exception as exc:  # noqa: BLE001 -- evidence is non-blocking here
+            print(f"July 5-style shadow follow-up unavailable (non-blocking): {exc}")
+    else:
+        print("July 5-style shadow follow-up unavailable: no v5 archive exists.")
+
+    print()
+    print("=" * 78)
+    print("UNQUALIFIED REAL-MONEY JULY 5-STYLE PILOT")
+    print("This command deliberately bypasses the startup qualification gate and")
+    print("the per-cycle observation entry filter. It is a hybrid opportunity set,")
+    print("not a reconstruction or proof that the July 5 bot will be profitable.")
+    print("It can quote spreads as wide as 98 cents and can admit extreme prices")
+    print("such as roughly 1c/98c when the relative payoff guards still pass.")
+    print("The $3 daily/session breakers are reactive thresholds, not a guaranteed")
+    print("maximum loss; fills and exits can take realized loss beyond $3.")
+    print("One-share sizing and all guarded shutdown protections remain enforced.")
+    print("=" * 78)
+
+    pilot = _guarded_july5_pilot_settings(base)
+    try:
+        require_live_confirmation(pilot)
+    except LiveTradingNotConfirmed as exc:
+        print(f"July 5-style live pilot not started: {exc}")
+        return
+
+    try:
+        pilot_observation_tracker = MarketObservationTracker(
+            pilot, path=JULY5_PILOT_OBSERVATION_FILE,
+        )
+    except Exception as exc:  # fail closed on a mismatched attribution spec
+        print(
+            "Cannot start July 5-style live pilot because its shadow "
+            f"attribution profile could not be initialized: {exc}"
+        )
+        return
+
+    from .live.circuit_breaker import CircuitBreaker, SessionCircuitBreaker
+    from .live.credentials import MissingCredentialsError, load_api_credentials
+    from .live.equity_protection import EquityProtection
+    from .live.instance_lock import AlreadyRunningError
+    from .live.us_client import CryptographyDependencyMissing, LiveUsClient
+    from .live.ws_market_data import WebSocketDependencyMissing
+    from .live.ws_runner import PilotFlatnessError, WebSocketLiveTradingBot
+
+    try:
+        credentials = load_api_credentials()
+        client = LiveUsClient(credentials=credentials, settings=pilot)
+    except (MissingCredentialsError, CryptographyDependencyMissing) as exc:
+        print(f"Cannot start July 5-style live pilot: {exc}")
+        return
+
+    daily_settings = dataclasses.replace(
+        loaded.circuit_breaker,
+        enabled=True,
+        daily_loss_limit_usd=3.0,
+    )
+    session_settings = dataclasses.replace(
+        loaded.session_circuit_breaker,
+        enabled=True,
+        loss_limit_usd=3.0,
+    )
+    equity_settings = dataclasses.replace(
+        loaded.equity_protection,
+        profit_lock_size_multiplier=1.0,
+    )
+    daily_breaker = CircuitBreaker(daily_settings)
+    if daily_breaker.is_halted():
+        print(
+            "July 5-style live pilot is locked because the daily circuit "
+            "breaker is already halted. Review the loss before resetting it."
+        )
+        return
+    bot = WebSocketLiveTradingBot(
+        client=client,
+        settings=pilot,
+        circuit_breaker=daily_breaker,
+        session_circuit_breaker=SessionCircuitBreaker(session_settings),
+        equity_protection=EquityProtection(equity_settings),
+        observation_tracker=pilot_observation_tracker,
+    )
+    print(
+        "Starting the unqualified July 5-style four-hour pilot: one share per "
+        "leg, up to 10 legs/five markets, widest-spread ordering, and $3 "
+        "reactive daily/session breakers. New entries stop after 3.5 hours; "
+        "shutdown must verify flat. No automatic scaling is permitted."
+    )
+    try:
+        bot.run_forever()
+    except (
+        WebSocketDependencyMissing,
+        AlreadyRunningError,
+        PilotFlatnessError,
+    ) as exc:
+        print(str(exc))
+
+
+def cmd_live_shadow_dryrun_start(_args: argparse.Namespace) -> None:
+    """Risk-free: runs the shadow-simulation engine against the real
+    public market-data feed with genuine one-share sizing, a fixed
+    evidence target/deadline, and a PASS/FAIL/INSUFFICIENT verdict -- no
+    order-placement or account-access capability exists anywhere in this
+    path. Real API credentials are still required (the market-data
+    WebSocket handshake itself must be signed), but only
+    WebSocketAuthSigner is constructed from them, never LiveUsClient."""
+    from .live.credentials import MissingCredentialsError, load_api_credentials
+    from .live.instance_lock import AlreadyRunningError
+    from .live.market_dryrun import (
+        DryRunFeedStalledError,
+        DryRunPolicy,
+        DryRunPolicyMismatchError,
+        run_dry_run,
+    )
+    from .live.ws_auth_signer import CryptographyDependencyMissing
+    from .live.ws_market_data import WebSocketDependencyMissing
+
+    settings = config.load_settings().live
+    try:
+        credentials = load_api_credentials()
+    except MissingCredentialsError as exc:
+        print(f"Cannot start dry-run: {exc}")
+        return
+
+    policy = DryRunPolicy()
+    print(
+        f"Starting risk-free dry-run: profile={policy.profile} "
+        f"order_shares={policy.order_shares}. No real order or account "
+        "capability exists in this process -- see live/market_dryrun.py."
+    )
+    try:
+        run_dry_run(credentials=credentials, settings=settings, policy=policy)
+    except (
+        CryptographyDependencyMissing,
+        DryRunPolicyMismatchError,
+        WebSocketDependencyMissing,
+        AlreadyRunningError,
+        DryRunFeedStalledError,
+    ) as exc:
+        print(f"Cannot start dry-run: {exc}")
+
+
+def cmd_live_shadow_dryrun_status(args: argparse.Namespace) -> None:
+    """Genuinely read-only: never constructs a MarketObservationTracker.
+    Displays the one canonical snapshot the running dry-run process
+    persists -- never recomputes verdict logic itself."""
+    from .live.market_dryrun import dry_run_status
+
+    snapshot = dry_run_status()
+    if args.json:
+        def _json_safe(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {key: _json_safe(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_json_safe(item) for item in value]
+            return value
+
+        print(json.dumps(_json_safe(snapshot), indent=2, allow_nan=False))
+        return
+
+    verdict = snapshot.get("verdict", "NOT_STARTED")
+    print(f"Dry-run status: verdict={verdict} phase={snapshot.get('phase')}")
+    if verdict in ("NOT_STARTED",):
+        return
+    if verdict == "PROVISIONAL":
+        print(
+            f"  round_trips={snapshot.get('round_trips')}  "
+            f"distinct_events={snapshot.get('distinct_events')}  "
+            f"entry_markout_samples={snapshot.get('entry_markout_samples')}  "
+            f"healthy_feed_hours={snapshot.get('healthy_feed_hours_elapsed')}  "
+            f"wall_clock_hours={snapshot.get('wall_clock_hours_elapsed')}"
+        )
+        return
+    detail = snapshot.get("detail") or {}
+    for key, value in detail.items():
+        print(f"  {key}={value}")
 
 
 def cmd_live_status(_args: argparse.Namespace) -> None:
@@ -357,6 +768,11 @@ def cmd_live_status(_args: argparse.Namespace) -> None:
 
     breaker = CircuitBreaker()
     print(f"Circuit breaker halted: {breaker.is_halted()}")
+    print(
+        "Session circuit breaker: in-memory only, not visible from this "
+        "process -- check the running live-start log for a trip (only a "
+        "live-start restart clears it)."
+    )
 
     equity_protection = EquityProtection()
     print(f"Equity protection halted: {equity_protection.is_halted()}")
@@ -455,11 +871,15 @@ def cmd_live_event_exposure(_args: argparse.Namespace) -> None:
     concentration that position-count alone hides -- e.g. many corner-count
     props on one soccer match. No raw_by_slug available outside a live
     refresh cycle, so bucket keys here always come from the slug heuristic.
+    Also folds in still-open resting orders' worst-case USD (via the local
+    ledger, not the exchange's open-order schema) so the "projected"
+    figures shown here match what a live refresh cycle's own cap
+    enforcement actually sees, not just settled positions.
     See live/RUNBOOK.md's most recent event-exposure section."""
     settings = config.load_settings().live
     from .live.credentials import MissingCredentialsError, load_api_credentials
     from .live.event_exposure import compute_event_exposures, resolve_capital_reference_usd
-    from .live.ledger import sum_position_pnl
+    from .live.ledger import get_known_order_details, strategy_total_pnl_usd
     from .live.us_client import CryptographyDependencyMissing, LiveUsClient, UsApiError
 
     try:
@@ -471,16 +891,23 @@ def cmd_live_event_exposure(_args: argparse.Namespace) -> None:
 
     try:
         positions = client.get_all_positions()
+        open_orders = client.get_open_orders()
     except UsApiError as exc:
-        print(f"Could not fetch positions: {exc}")
+        print(f"Could not fetch positions/open orders: {exc}")
         return
 
     equity_settings = config.load_settings().equity_protection
-    total_pnl = sum_position_pnl(positions)
+    total_pnl = strategy_total_pnl_usd(positions)
+    if total_pnl is None:
+        print("Could not compute complete strategy P/L; exposure report withheld.")
+        return
     capital_reference_usd = resolve_capital_reference_usd(
         equity_settings.starting_capital_usd, total_pnl, positions,
     )
-    exposures = compute_event_exposures(positions, capital_reference_usd)
+    order_details = get_known_order_details()
+    exposures = compute_event_exposures(
+        positions, capital_reference_usd, open_orders=open_orders, order_details=order_details,
+    )
     print(dashboard.render_event_exposure(exposures, capital_reference_usd))
 
 
@@ -503,6 +930,509 @@ def cmd_live_family_performance(_args: argparse.Namespace) -> None:
     from .live.fills import get_all_fills
 
     print(dashboard.render_family_performance(compute_family_performance(get_all_fills())))
+
+
+def cmd_live_observation_report(args: argparse.Namespace) -> None:
+    """Read-only schema-v4 portfolio/cohort qualification report."""
+    from .live.market_observation import (
+        load_observation_report,
+        load_observation_summary,
+    )
+
+    profile = args.profile
+    summary = load_observation_summary(profile=profile)
+    rows = load_observation_report(profile=profile)[: max(1, args.top)]
+    if args.json:
+        def _json_safe(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {key: _json_safe(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_json_safe(item) for item in value]
+            return value
+
+        print(json.dumps(
+            _json_safe({"summary": summary, "markets": rows}),
+            indent=2,
+            allow_nan=False,
+        ))
+        return
+    print(
+        f"Schema-v4 {profile} portfolio observation: "
+        f"status={summary['status']}"
+    )
+    completion_mode = summary.get("evaluation_completion_mode", "wall_clock")
+    # In healthy_feed_target mode the wall-clock deadline does not control
+    # completion at all (see RUNBOOK 44) -- never present it as if it does.
+    deadline_label = (
+        "completion_mode=healthy_feed_target" if completion_mode == "healthy_feed_target"
+        else f"deadline={summary['evaluation_deadline_epoch']:.0f}"
+    )
+    print(
+        f"window_start={summary['started_at_epoch']:.0f}  "
+        f"{deadline_label}  "
+        f"round_trips={summary['completed_round_trips']}  "
+        f"events={summary['distinct_event_count']}  "
+        f"forced_exits={summary['forced_exit_count']}"
+    )
+    print(
+        f"markets={summary['market_count']}  "
+        f"book_samples={summary['book_sample_count']}  "
+        f"observed_market_hours={summary['observed_market_hours']:.2f}  "
+        f"eligible_quote_hours={summary['eligible_quote_hours']:.2f}  "
+        f"tape_trades={summary['tape_trade_count']}  "
+        f"qualifying_trades={summary['qualifying_tape_trade_count']}  "
+        f"shadow_fills={summary['hypothetical_fill_count']}"
+    )
+    print(
+        f"healthy_feed_hours={summary['healthy_feed_hours']:.2f}  "
+        f"coverage_target_hours={summary['coverage_target_hours']:.2f}  "
+        f"feed_coverage={summary['feed_coverage_ratio']:.1%}  "
+        f"open_shadow_positions={summary['open_shadow_strategy_positions']}  "
+        f"deadline_finalized={bool(summary['evaluation_finalization'].get('complete'))}"
+    )
+    continuation = summary.get("observation_continuation") or {}
+    if continuation:
+        print(
+            "continuation="
+            f"{continuation.get('status', 'unknown')}  "
+            f"requested_hours={float(continuation.get('requested_hours') or 0):.2f}"
+        )
+    coverage_completion = summary.get("observation_coverage_completion") or {}
+    if coverage_completion:
+        print(
+            "healthy_feed_completion="
+            f"{coverage_completion.get('status', 'unknown')}  "
+            f"target_hours={summary['healthy_feed_target_hours']:.2f}  "
+            f"remaining_hours={summary['remaining_healthy_feed_hours']:.2f}"
+        )
+    elif completion_mode == "healthy_feed_target":
+        # A v5+ archive starts directly in this mode (no retroactive-arm
+        # record exists) -- still show what actually governs completion.
+        print(
+            "healthy_feed_completion=governs_completion  "
+            f"target_hours={summary['healthy_feed_target_hours']:.2f}  "
+            f"remaining_hours={summary['remaining_healthy_feed_hours']:.2f}"
+        )
+    avg_5m = summary["avg_markout_5m_cents"]
+    avg_5m_text = "n/a" if avg_5m is None else f"{avg_5m:+.3f}c"
+    profit_factor = summary["profit_factor"]
+    pf_text = "inf" if profit_factor == float("inf") else f"{profit_factor:.3f}"
+    print(
+        f"realized=${summary['realized_pnl_usd']:+.4f}  "
+        f"open_mtm=${summary['open_inventory_mark_to_market_usd']:+.4f}  "
+        f"total=${summary['total_pnl_usd']:+.4f}  PF={pf_text}  "
+        f"avg_5m={avg_5m_text}  "
+        f"max_drawdown=${summary['maximum_drawdown_usd']:+.4f}  "
+        f"event_concentration={summary['event_profit_concentration']:.1%}"
+    )
+    if summary["blocked_reasons"]:
+        print(f"blocked: {'; '.join(summary['blocked_reasons'])}")
+    if summary["open_inventory"]:
+        print("Open inventory (included in total P&L; prevents qualification):")
+        for item in summary["open_inventory"]:
+            print(
+                f"  {item['market_slug']} shares={item['shares']:+.4f} "
+                f"mark={item['mark_price']} "
+                f"mtm=${item['mark_to_market_pnl_usd']:+.4f}"
+            )
+    print("Cohorts:")
+    if not summary["cohorts"]:
+        print("  none")
+    for cohort in summary["cohorts"]:
+        markout = cohort["avg_markout_5m_cents"]
+        markout_text = "n/a" if markout is None else f"{markout:+.3f}c"
+        print(
+            f"  eligible={cohort['live_eligible']} "
+            f"round_trips={cohort['completed_round_trips']} "
+            f"events={cohort['distinct_event_count']} "
+            f"pnl=${cohort['net_pnl_usd']:+.4f} "
+            f"avg_5m={markout_text} {cohort['cohort_key']}"
+        )
+    if not rows:
+        print("No market-level observation evidence recorded yet.")
+        return
+    print("Market details")
+    print(
+        "evidence_ready  eligible/all_trades  fills  episodes  roundtrips  "
+        "paper_pnl  avg_1m  avg_5m  eligible_min  market"
+    )
+    for row in rows:
+        avg_1m = row["avg_markout_1m_cents"]
+        avg_5m = row["avg_markout_5m_cents"]
+        avg_1m_text = "n/a" if avg_1m is None else f"{avg_1m:+.2f}c"
+        avg_5m_text = "n/a" if avg_5m is None else f"{avg_5m:+.2f}c"
+        print(
+            f"{str(row['evidence_ready']):>14}  "
+            f"{row['qualifying_trade_count']:>8}/{row['trade_count']:<8}  "
+            f"{row['hypothetical_fill_count']:>5}  "
+            f"{row['distinct_fill_episodes']:>8}  "
+            f"{row['paper_round_trip_count']:>10}  "
+            f"{row['paper_realized_pnl_usd']:>+9.4f}  "
+            f"{avg_1m_text:>7}  {avg_5m_text:>7}  "
+            f"{row['eligible_observed_seconds'] / 60:>12.1f}  "
+            f"{row['market_slug']}"
+        )
+        evidence_reasons = [
+            reason for reason in row["blocked_reasons"]
+            if reason != "observation-only mode is enabled"
+        ]
+        if evidence_reasons:
+            print(f"                blocked: {'; '.join(evidence_reasons)}")
+
+
+def cmd_live_observation_continue(args: argparse.Namespace) -> None:
+    """Arm a one-time continuation of expired compatible v4 evidence."""
+    from .live.instance_lock import AlreadyRunningError, InstanceLock
+    from .live.market_observation import (
+        MarketObservationTracker,
+        ObservationContinuationError,
+    )
+
+    try:
+        with InstanceLock():
+            tracker = MarketObservationTracker(config.load_settings().live)
+            result = tracker.arm_continuation(hours=args.hours)
+    except (AlreadyRunningError, ObservationContinuationError) as exc:
+        raise SystemExit(f"Observation continuation was not armed: {exc}") from exc
+
+    print(
+        "Armed the one-time observation continuation. Existing evidence was "
+        "preserved and its clock has NOT started yet."
+    )
+    print(
+        f"requested_hours={result['requested_hours']:.2f}  "
+        f"healthy_feed_hours_preserved={result['healthy_feed_hours_at_arm']:.2f}"
+    )
+    print(
+        f"The {result['requested_hours']:.2f}-hour clock starts on the first "
+        "confirmed market-feed activity after the next successful "
+        "observation-mode live-start."
+    )
+
+
+def cmd_live_observation_complete(_args: argparse.Namespace) -> None:
+    """Arm healthy-feed completion for compatible insufficient v4 evidence."""
+    from .live.instance_lock import AlreadyRunningError, InstanceLock
+    from .live.market_observation import (
+        MarketObservationTracker,
+        ObservationCoverageCompletionError,
+    )
+
+    try:
+        with InstanceLock():
+            tracker = MarketObservationTracker(config.load_settings().live)
+            result = tracker.arm_healthy_feed_completion()
+    except (AlreadyRunningError, ObservationCoverageCompletionError) as exc:
+        raise SystemExit(
+            f"Healthy-feed completion was not armed: {exc}"
+        ) from exc
+
+    print(
+        "Armed healthy-feed completion without resetting observation evidence."
+    )
+    print(
+        f"preserved_healthy_hours={result['healthy_feed_hours_at_arm']:.2f}  "
+        f"target_healthy_hours={result['target_healthy_feed_hours']:.2f}  "
+        f"remaining_healthy_hours={result['remaining_healthy_feed_hours_at_arm']:.2f}"
+    )
+
+
+def _without_settlement_pass(state: dict) -> dict:
+    finalization = state.get("evaluation_finalization")
+    if not isinstance(finalization, dict) or "settlement_pass" not in finalization:
+        return state
+    trimmed = copy.deepcopy(state)
+    trimmed["evaluation_finalization"].pop("settlement_pass", None)
+    return trimmed
+
+
+def cmd_live_observation_settle(args: argparse.Namespace) -> None:
+    """One-time maintenance: settle shadow inventory on markets that have
+    genuinely resolved. finalize_evaluation()'s book-based sweep can never
+    close these -- a resolved market has no book left to fetch, no matter
+    how long the process waits or reconnects -- so this queries the
+    market's actual settlement outcome instead and closes the position at
+    the real payout. Read-only against the exchange either way (both
+    lookup endpoints are unauthenticated); dry-run by default, --apply
+    required to persist. See live/RUNBOOK.md's most recent section."""
+    from .live.instance_lock import AlreadyRunningError, InstanceLock
+    from .live.market_observation import (
+        MarketObservationTracker,
+        classify_settlement_lookup,
+    )
+
+    try:
+        with InstanceLock():
+            tracker = MarketObservationTracker(config.load_settings().live)
+            unresolved = sorted(tracker.open_inventory_slugs())
+            if not unresolved:
+                print("No shadow inventory is stuck -- nothing to settle.")
+                return
+
+            client = PolymarketClient()
+            print(f"Resolving {len(unresolved)} slug(s) with open shadow inventory...")
+            results = [classify_settlement_lookup(client, slug) for slug in unresolved]
+
+            errors = [row for row in results if row["status"] == "ERROR"]
+            if errors:
+                print(
+                    f"Aborting: {len(errors)} slug(s) returned an ambiguous or failed "
+                    "lookup -- no changes made, real or projected."
+                )
+                for row in errors:
+                    print(f"  {row['slug']}: {row.get('reason')}")
+                raise SystemExit(1)
+
+            settled_count = sum(1 for row in results if row["status"] == "SETTLED")
+            unresolved_count = sum(1 for row in results if row["status"] == "UNRESOLVED")
+            print(f"{settled_count} settled, {unresolved_count} still genuinely unresolved.")
+
+            before_state = copy.deepcopy(tracker._state)
+            now = time.time()
+            batch_result = tracker.apply_settlement_batch(results, now)
+            # The settlement_pass audit entry legitimately carries a fresh
+            # wall-clock timestamp on every attempt, even when nothing else
+            # changed (e.g. a market is still genuinely unresolved on a
+            # rerun) -- comparing it verbatim would mean "identical
+            # projected state" could never be true except on the very first
+            # write. Exclude it specifically from the no-op comparison;
+            # everything else (blocker lists, complete, coverage status,
+            # every fill/position) still has to match exactly.
+            is_noop = (
+                _without_settlement_pass(tracker._state)
+                == _without_settlement_pass(before_state)
+            )
+
+            summary = tracker.profile_summary("controlled")
+            print(
+                f"Projected controlled result: status={summary['status']}  "
+                f"total_pnl=${summary['total_pnl_usd']:+.4f}  "
+                f"settlement_exits={summary['settlement_exit_count']}  "
+                f"settlement_pnl=${summary['settlement_pnl_usd']:+.4f}  "
+                f"remaining_unresolved={len(batch_result['remaining_unresolved_slugs'])}  "
+                f"finalization_complete={batch_result['complete']}"
+            )
+
+            if is_noop:
+                print(
+                    "Projected state is identical to what's already persisted -- "
+                    "nothing to write."
+                )
+                return
+
+            if not args.apply:
+                print(
+                    "Dry run only -- no changes written. Re-run with --apply to "
+                    "persist this."
+                )
+                return
+
+            backup_path = tracker.path.with_name(
+                f"{tracker.path.stem}.pre-settlement-backup-{int(now)}{tracker.path.suffix}"
+            )
+            try:
+                shutil.copy2(tracker.path, backup_path)
+            except OSError as exc:
+                raise SystemExit(
+                    f"Could not create a backup at {backup_path} -- refusing to "
+                    f"write without one: {exc}"
+                ) from exc
+            print(f"Backed up the current observation file to {backup_path}.")
+            tracker.flush()
+            print(
+                f"Applied. Settled {len(batch_result['settled_slugs'])} slug(s); "
+                f"wrote {tracker.path}."
+            )
+    except AlreadyRunningError as exc:
+        raise SystemExit(f"Cannot run live-observation-settle: {exc}") from exc
+    print(
+        "Only confirmed feed minutes count. Stopping and restarting pauses "
+        "progress instead of consuming a wall-clock deadline."
+    )
+
+
+def cmd_live_observation_replay(args: argparse.Namespace) -> None:
+    """Read-only offline attribution/replay over already-collected schema-v4
+    evidence. No network calls, never mutates the archive it reads."""
+    from .live.observation_replay import run_replay
+
+    report = run_replay()
+    if args.json:
+        def _json_safe(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {key: _json_safe(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_json_safe(item) for item in value]
+            return value
+
+        print(json.dumps(_json_safe(report), indent=2, allow_nan=False))
+        return
+
+    def _pf(value: float) -> str:
+        return "inf" if value == float("inf") else f"{value:.3f}"
+
+    print(
+        "NOTE: baseline figures are persisted hypothetical shadow fills "
+        "(including synthetic settlement closes), not real exchange fills. "
+        "A crossing print is an optimistic upper bound, never a guaranteed "
+        "fill; aggressive taker-exit feasibility is always UNKNOWN -- no "
+        "historical L2 was retained. This command cannot authorize a pilot "
+        "unlock; see live-observation-report for actual pilot status."
+    )
+    for profile, strategies in report["profiles"].items():
+        print(f"== profile={profile} ==")
+        completion = strategies.get("_completion") or {}
+        if completion:
+            print(
+                f"  healthy_feed_hours={completion['healthy_feed_hours']:.2f}  "
+                f"healthy_feed_target_hours={completion['healthy_feed_target_hours']:.2f}  "
+                f"remaining_healthy_feed_hours={completion['remaining_healthy_feed_hours']:.2f}  "
+                f"open_inventory_count={completion['open_inventory_count']}  "
+                f"open_shadow_strategy_positions={completion['open_shadow_strategy_positions']}  "
+                f"evaluation_finalization_complete={completion['evaluation_finalization_complete']}"
+            )
+        for strategy, data in strategies.items():
+            if strategy == "_completion":
+                continue
+            baseline = data["baseline"]
+            verdict = data["verdict"]
+            print(
+                f"  strategy={strategy}  round_trips={baseline['round_trips']}  "
+                f"net_pnl=${baseline['net_pnl_usd']:+.4f}  PF={_pf(baseline['profit_factor'])}  "
+                f"max_drawdown=${baseline['max_drawdown_usd']:+.4f}"
+            )
+            print(
+                "    one_share_equivalent (linear estimate, not proof of actual "
+                f"1-share execution): net_pnl=${baseline['net_pnl_one_share_equivalent_usd']:+.4f}  "
+                f"max_drawdown=${baseline['max_drawdown_one_share_equivalent_usd']:+.4f}"
+            )
+            optimistic_total = verdict["optimistic_passive_total_usd"]
+            optimistic_text = "n/a" if optimistic_total is None else f"${optimistic_total:+.4f}"
+            print(
+                f"    verdict: baseline_shadow_status={verdict['baseline_shadow_status']}  "
+                f"passive_replay_status={verdict['passive_replay_status']}  "
+                f"taker_replay_status={verdict['taker_replay_status']}  "
+                f"pilot_unlock_authorized={verdict['pilot_unlock_authorized']}  "
+                f"optimistic_passive_total={optimistic_text}"
+            )
+            print(f"    escalation_replay status counts: {dict(verdict['escalation_status_counts'])}")
+            print(
+                "    hard_pre_settlement_exit rows: "
+                f"{len(data['hard_pre_settlement_exit'])}"
+            )
+            print("    entry_filter_sweep (first 5 rows):")
+            for row in data["entry_filter_sweep"][:5]:
+                print(
+                    f"      min_hours={row['min_hours_remaining']:.2f}  "
+                    f"min_same_market_trailing_trades={row['min_same_market_trailing_trade_count']}  "
+                    f"kept={row['entries_kept']}  rejected={row['entries_rejected']}  "
+                    f"net_pnl=${row['net_pnl_usd']:+.4f}  PF={_pf(row['profit_factor'])}"
+                )
+            print("    revised_cohorts:")
+            if not data["revised_cohorts"]:
+                print("      none")
+            for cohort in data["revised_cohorts"]:
+                print(
+                    f"      eligible={cohort['revised_eligible']}  "
+                    f"round_trips={cohort['round_trips']}  "
+                    f"distinct_events={cohort['distinct_event_count']}  "
+                    f"net_pnl=${cohort['net_pnl_usd']:+.4f} "
+                    f"(1sh_equiv=${cohort['net_pnl_one_share_equivalent_usd']:+.4f})  "
+                    f"PF={_pf(cohort['profit_factor'])}  "
+                    f"drawdown=${cohort['max_drawdown_usd']:+.4f} "
+                    f"(1sh_equiv=${cohort['max_drawdown_one_share_equivalent_usd']:+.4f})  "
+                    f"settlement_exit_rate={cohort['settlement_exit_rate']:.1%}  "
+                    f"{cohort['cohort_key']}"
+                )
+            follow_up = data.get("follow_up")
+            if follow_up is not None:
+                print(
+                    f"    follow_up_status={follow_up['status']}  "
+                    f"(primary_strategy={follow_up['primary_strategy']})"
+                )
+                if follow_up["blocked_reasons"]:
+                    for reason in follow_up["blocked_reasons"]:
+                        print(f"      blocked: {reason}")
+
+
+def cmd_live_pnl(_args: argparse.Namespace) -> None:
+    """Fully read-only: realized P&L attribution -- FIFO lot matching
+    (live/lot_accounting.py) over fills.json, closed out by any detected
+    settlements (live/settlements.py), broken down by family/event/price-
+    band/entry-time/entry-date (live/pnl_attribution.py). No credentials
+    needed -- only reads local fills.json/settlements.json. Unlike
+    live-family-performance's markout (a proxy), this is actual realized
+    P&L. See live/RUNBOOK.md's most recent section."""
+    from .live.fills import get_all_fills
+    from .live.lot_accounting import compute_lots
+    from .live.pnl_attribution import (
+        compute_pnl_by_entry_date,
+        compute_pnl_by_entry_time_band,
+        compute_pnl_by_event,
+        compute_pnl_by_family,
+        compute_pnl_by_price_band,
+        compute_pnl_summary,
+    )
+    from .live.settlements import get_all_settlements, get_earliest_snapshot_by_slug
+
+    lot_result = compute_lots(get_all_fills(), get_all_settlements(), get_earliest_snapshot_by_slug())
+    summary = compute_pnl_summary(lot_result)
+    breakdowns = {
+        "Family": compute_pnl_by_family(lot_result.closed_lots),
+        "Event": compute_pnl_by_event(lot_result.closed_lots),
+        "Price band (entry)": compute_pnl_by_price_band(lot_result.closed_lots),
+        "Entry time (UTC)": compute_pnl_by_entry_time_band(lot_result.closed_lots),
+        "Entry date": compute_pnl_by_entry_date(lot_result.closed_lots),
+    }
+    print(dashboard.render_pnl_attribution(summary, breakdowns, lot_result))
+
+
+def cmd_live_pnl_reconcile(_args: argparse.Namespace) -> None:
+    """Read-only diagnostic (no order placement/cancellation, needs
+    credentials to fetch positions): cross-checks fill-based realized P&L
+    (live/lot_accounting.py, "Strategy A") against the exchange's own
+    latest realized-position-snapshot figure (live/settlements.py,
+    "Strategy B") per market -- see
+    live/reconciliation.py::reconcile_realized_pnl. Records a fresh
+    position snapshot first so the comparison reflects right now, not just
+    whatever the last live-start cycle happened to see."""
+    settings = config.load_settings().live
+    from .live.credentials import MissingCredentialsError, load_api_credentials
+    from .live.fills import get_all_fills
+    from .live.lot_accounting import compute_lots
+    from .live.reconciliation import reconcile_realized_pnl
+    from .live.settlements import (
+        get_all_settlements,
+        get_earliest_snapshot_by_slug,
+        get_latest_snapshot_by_slug,
+        record_position_snapshots,
+    )
+    from .live.us_client import CryptographyDependencyMissing, LiveUsClient, UsApiError
+
+    try:
+        credentials = load_api_credentials()
+        client = LiveUsClient(credentials=credentials, settings=settings)
+    except (MissingCredentialsError, CryptographyDependencyMissing) as exc:
+        print(f"Cannot reconcile P&L: {exc}")
+        return
+
+    try:
+        positions = client.get_all_positions()
+    except UsApiError as exc:
+        print(f"Could not fetch positions: {exc}")
+        return
+
+    record_position_snapshots(positions)
+    lot_result = compute_lots(get_all_fills(), get_all_settlements(), get_earliest_snapshot_by_slug())
+    reports = reconcile_realized_pnl(
+        lot_result.closed_lots, get_latest_snapshot_by_slug(),
+        tolerance_usd=settings.pnl_reconcile_tolerance_usd,
+    )
+    print(dashboard.render_pnl_reconciliation(reports))
 
 
 def cmd_live_migrate_fills(_args: argparse.Namespace) -> None:
@@ -573,7 +1503,10 @@ def cmd_live_reset_breaker(_args: argparse.Namespace) -> None:
 
     from .live.circuit_breaker import CircuitBreaker
     CircuitBreaker().reset()
-    print("Circuit breaker reset. Trading may resume on the next refresh cycle.")
+    print(
+        "Circuit breaker reset from the recorded trip P/L. A fresh configured "
+        "loss allowance now applies until the next UTC day."
+    )
 
 
 def cmd_live_reset_equity_protection(_args: argparse.Namespace) -> None:
@@ -616,6 +1549,34 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "live-start", help="REAL MONEY: start live market-making. See live/RUNBOOK.md first."
     )
+    subparsers.add_parser(
+        "live-pilot-start",
+        help="REAL MONEY: start the qualified one-share guarded pilot.",
+    )
+    subparsers.add_parser(
+        "live-pilot-start-july5",
+        help=(
+            "REAL MONEY: start the unqualified one-share July 5-style pilot; "
+            "explicitly bypasses observation qualification."
+        ),
+    )
+    subparsers.add_parser(
+        "live-shadow-dryrun-start",
+        help=(
+            "RISK-FREE: run the shadow-simulation engine against the real "
+            "public market-data feed with one-share sizing for a bounded "
+            "evidence target/deadline, producing a PASS/FAIL/INSUFFICIENT "
+            "verdict. No order-placement or account-access capability "
+            "exists in this path."
+        ),
+    )
+    dryrun_status_parser = subparsers.add_parser(
+        "live-shadow-dryrun-status",
+        help="Read-only: show the current risk-free dry-run's progress/verdict snapshot.",
+    )
+    dryrun_status_parser.add_argument(
+        "--json", action="store_true", help="Emit the snapshot as JSON."
+    )
     subparsers.add_parser("live-status", help="Show circuit breaker / live order status.")
     subparsers.add_parser(
         "live-reconcile-orders",
@@ -631,6 +1592,71 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "live-family-performance",
         help="Read-only: markout-based performance grouped by a coarse market-type family heuristic.",
+    )
+    observation_parser = subparsers.add_parser(
+        "live-observation-report",
+        help="Read-only: show real trade flow and hypothetical maker-fill evidence.",
+    )
+    observation_parser.add_argument("--top", type=int, default=20, help="Number of markets to show.")
+    observation_parser.add_argument(
+        "--profile",
+        choices=("legacy", "controlled", "july5_style"),
+        default="controlled",
+        help="Shadow portfolio profile to report.",
+    )
+    observation_parser.add_argument(
+        "--json", action="store_true", help="Emit the complete report as JSON."
+    )
+    continuation_parser = subparsers.add_parser(
+        "live-observation-continue",
+        help=(
+            "One-time maintenance: preserve expired v4 evidence and arm a "
+            "bounded continuation."
+        ),
+    )
+    continuation_parser.add_argument(
+        "--hours",
+        type=float,
+        default=30.0,
+        help="Continuation duration after confirmed feed startup (default: 30).",
+    )
+    subparsers.add_parser(
+        "live-observation-complete",
+        help=(
+            "One-time maintenance: preserve compatible evidence and finish "
+            "the missing healthy-feed target."
+        ),
+    )
+    settle_parser = subparsers.add_parser(
+        "live-observation-settle",
+        help=(
+            "Maintenance: settle shadow inventory on markets that have "
+            "genuinely resolved. Dry-run by default."
+        ),
+    )
+    settle_parser.add_argument(
+        "--apply", action="store_true",
+        help="Persist the settlement (writes a timestamped backup first). Default: dry-run.",
+    )
+    replay_parser = subparsers.add_parser(
+        "live-observation-replay",
+        help=(
+            "Read-only: offline attribution/replay over already-collected "
+            "evidence -- escalating exits, entry rejection, a hard "
+            "never-hold-through-settlement check, and revised cohort "
+            "qualification. No network calls; never mutates the archive."
+        ),
+    )
+    replay_parser.add_argument(
+        "--json", action="store_true", help="Emit the complete report as JSON."
+    )
+    subparsers.add_parser(
+        "live-pnl",
+        help="Read-only: realized P&L attribution (FIFO lot matching), broken down multiple ways.",
+    )
+    subparsers.add_parser(
+        "live-pnl-reconcile",
+        help="Read-only: cross-check fill-based realized P&L against the exchange's own figures.",
     )
     subparsers.add_parser(
         "live-migrate-fills",
@@ -657,11 +1683,22 @@ COMMANDS = {
     "show-portfolio": cmd_show_portfolio,
     "live-preview": cmd_live_preview,
     "live-start": cmd_live_start,
+    "live-pilot-start": cmd_live_pilot_start,
+    "live-pilot-start-july5": cmd_live_pilot_start_july5,
+    "live-shadow-dryrun-start": cmd_live_shadow_dryrun_start,
+    "live-shadow-dryrun-status": cmd_live_shadow_dryrun_status,
     "live-status": cmd_live_status,
     "live-reconcile-orders": cmd_live_reconcile_orders,
     "live-event-exposure": cmd_live_event_exposure,
     "live-fills": cmd_live_fills,
     "live-family-performance": cmd_live_family_performance,
+    "live-observation-report": cmd_live_observation_report,
+    "live-observation-continue": cmd_live_observation_continue,
+    "live-observation-complete": cmd_live_observation_complete,
+    "live-observation-settle": cmd_live_observation_settle,
+    "live-observation-replay": cmd_live_observation_replay,
+    "live-pnl": cmd_live_pnl,
+    "live-pnl-reconcile": cmd_live_pnl_reconcile,
     "live-migrate-fills": cmd_live_migrate_fills,
     "live-cancel-all": cmd_live_cancel_all,
     "live-reset-breaker": cmd_live_reset_breaker,

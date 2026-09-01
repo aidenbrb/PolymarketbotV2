@@ -4,12 +4,34 @@ from polymarket_bot.live.pricing import (
     _ceil_to_tick,
     _floor_to_tick,
     apply_cost_basis_floor,
+    apply_liquidation_limit,
     compute_book_aware_quote,
     compute_quote,
     floor_to_quantity_step,
     round_to_tick,
     usd_to_shares,
 )
+
+
+def test_liquidation_limit_allows_bounded_loss_for_long():
+    assert apply_liquidation_limit(
+        0.45, net_position=10, avg_cost=0.50, tick_size=0.01,
+        allowed_loss_cents=3.0, max_total_loss_usd=2.0,
+    ) == pytest.approx(0.47)
+
+
+def test_liquidation_limit_total_dollar_cap_tightens_large_position():
+    assert apply_liquidation_limit(
+        0.40, net_position=100, avg_cost=0.50, tick_size=0.01,
+        allowed_loss_cents=5.0, max_total_loss_usd=2.0,
+    ) == pytest.approx(0.48)
+
+
+def test_liquidation_limit_allows_bounded_loss_for_short():
+    assert apply_liquidation_limit(
+        0.60, net_position=-10, avg_cost=0.50, tick_size=0.01,
+        allowed_loss_cents=4.0, max_total_loss_usd=2.0,
+    ) == pytest.approx(0.54)
 
 
 @pytest.mark.parametrize(
@@ -101,6 +123,15 @@ def test_book_aware_quote_never_quotes_below_absolute_exchange_minimum():
     quote = compute_book_aware_quote(best_bid=0.008, best_ask=0.025, tick_size=0.001)
     assert quote is not None
     assert quote.bid >= 0.01
+
+
+def test_book_aware_quote_never_quotes_above_absolute_exchange_maximum():
+    # Mirror of the bid-side minimum test above -- the ask must be clamped
+    # to the same 0.99 ceiling the bid is clamped to on the low side.
+    # best_ask - tick_size (0.997) would otherwise exceed 0.99 uncapped.
+    quote = compute_book_aware_quote(best_bid=0.90, best_ask=0.998, tick_size=0.001)
+    assert quote is not None
+    assert quote.ask <= 0.99
 
 
 def test_book_aware_quote_rejects_invalid_inputs():

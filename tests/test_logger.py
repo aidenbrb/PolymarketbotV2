@@ -1,5 +1,7 @@
 import logging
+import logging.handlers
 
+from polymarket_bot import config
 from polymarket_bot import logger as logger_module
 
 
@@ -28,3 +30,18 @@ def test_setup_logging_never_attaches_a_file_handler_under_pytest():
                 handler.close()
         root.handlers = saved_handlers
         logger_module._CONFIGURED = saved_configured
+
+
+def test_build_file_handler_is_rotating_with_configured_size_and_backup_count(tmp_path, monkeypatch):
+    # Must never touch the real project's logs/bot.log from a test run --
+    # same real-contamination risk the pytest-guard test above exists for.
+    monkeypatch.setattr(logger_module.config, "LOGS_DIR", tmp_path)
+    settings = config.Settings(log_max_bytes=123456, log_backup_count=4)
+
+    handler = logger_module._build_file_handler(settings)
+    try:
+        assert isinstance(handler, logging.handlers.RotatingFileHandler)
+        assert handler.maxBytes == 123456
+        assert handler.backupCount == 4
+    finally:
+        handler.close()

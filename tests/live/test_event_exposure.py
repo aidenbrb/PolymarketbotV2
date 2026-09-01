@@ -177,3 +177,111 @@ class TestComputeEventExposures:
     def test_non_dict_position_value_skipped_not_crashed(self):
         positions = {"weird-slug": "not-a-dict"}
         assert compute_event_exposures(positions, capital_reference_usd=100.0) == []
+
+
+class TestProjectedExposureWithRestingOrders:
+    def test_backward_compatible_when_open_orders_omitted(self):
+        # Reproduces today's exact settled-only output when the new
+        # params aren't passed -- every pre-existing caller/test unaffected.
+        positions = {
+            "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5": {
+                "netPositionDecimal": "5", "cost": {"value": "3.0"}, "cashValue": {"value": "3.0"},
+            },
+        }
+        e = compute_event_exposures(positions, capital_reference_usd=100.0)[0]
+        assert e.resting_worst_case_usd == 0.0
+        assert e.stat_prop_resting_worst_case_usd == 0.0
+        assert e.projected_pct_of_capital == e.pct_of_capital == pytest.approx(0.03)
+        assert e.stat_prop_projected_pct_of_capital == e.stat_prop_pct_of_capital == pytest.approx(0.0)
+
+    def test_increasing_side_resting_order_adds_to_projected_exposure(self):
+        slug = "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5"
+        positions = {slug: {"netPositionDecimal": "5", "cost": {"value": "3.0"}, "cashValue": {"value": "3.0"}}}
+        open_orders = [{"id": "o1", "marketSlug": slug}]
+        order_details = {"o1": {"market_id": slug, "side": "BUY", "price": 0.5, "size": 4.0}}
+
+        e = compute_event_exposures(
+            positions, capital_reference_usd=100.0, open_orders=open_orders, order_details=order_details,
+        )[0]
+        assert e.resting_worst_case_usd == pytest.approx(2.0)  # 4.0 shares * 0.5 price
+        assert e.cost_basis_usd == pytest.approx(3.0)  # settled figure unaffected
+        assert e.projected_pct_of_capital == pytest.approx(0.05)  # (3.0 + 2.0) / 100.0
+
+    def test_reducing_side_resting_order_excluded(self):
+        # Long 5 shares -- a resting SELL is the REDUCING side and must not
+        # add to projected exposure (it lowers risk if it fills, not raises it).
+        slug = "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5"
+        positions = {slug: {"netPositionDecimal": "5", "cost": {"value": "3.0"}, "cashValue": {"value": "3.0"}}}
+        open_orders = [{"id": "o1", "marketSlug": slug}]
+        order_details = {"o1": {"market_id": slug, "side": "SELL", "price": 0.5, "size": 4.0}}
+
+        e = compute_event_exposures(
+            positions, capital_reference_usd=100.0, open_orders=open_orders, order_details=order_details,
+        )[0]
+        assert e.resting_worst_case_usd == 0.0
+        assert e.projected_pct_of_capital == pytest.approx(e.pct_of_capital)
+
+    def test_increasing_short_uses_complementary_worst_case_cost(self):
+        slug = "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5"
+        positions = {
+            slug: {
+                "netPositionDecimal": "-5",
+                "cost": {"value": "1.0"},
+                "cashValue": {"value": "1.0"},
+            }
+        }
+        open_orders = [{"id": "o1", "marketSlug": slug}]
+        order_details = {
+            "o1": {"market_id": slug, "side": "SELL", "price": 0.9, "size": 10.0}
+        }
+
+        exposure = compute_event_exposures(
+            positions,
+            capital_reference_usd=100.0,
+            open_orders=open_orders,
+            order_details=order_details,
+        )[0]
+
+        assert exposure.resting_worst_case_usd == pytest.approx(1.0)
+
+    def test_unmatched_order_id_skipped_not_counted(self, caplog):
+        slug = "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5"
+        positions = {slug: {"netPositionDecimal": "5", "cost": {"value": "3.0"}, "cashValue": {"value": "3.0"}}}
+        open_orders = [{"id": "unknown-order", "marketSlug": slug}]
+
+        with caplog.at_level("WARNING"):
+            e = compute_event_exposures(
+                positions, capital_reference_usd=100.0, open_orders=open_orders, order_details={},
+            )[0]
+        assert e.resting_worst_case_usd == 0.0
+        assert any("no matching ledger entry" in r.message for r in caplog.records)
+
+    def test_stat_prop_resting_split_mirrors_cost_basis_split(self):
+        slug = "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5"
+        positions = {slug: {"netPositionDecimal": "5", "cost": {"value": "3.0"}, "cashValue": {"value": "3.0"}}}
+        raw_by_slug = {slug: {"marketType": "props"}}
+        open_orders = [{"id": "o1", "marketSlug": slug}]
+        order_details = {"o1": {"market_id": slug, "side": "BUY", "price": 0.5, "size": 4.0}}
+
+        e = compute_event_exposures(
+            positions, capital_reference_usd=100.0, raw_by_slug=raw_by_slug,
+            open_orders=open_orders, order_details=order_details,
+        )[0]
+        assert e.stat_prop_resting_worst_case_usd == pytest.approx(2.0)
+        assert e.stat_prop_projected_pct_of_capital == pytest.approx(0.05)
+
+    def test_resting_order_in_bucket_with_no_settled_position_still_counted(self):
+        # A brand-new candidate (zero position) that already has a resting
+        # order this cycle -- must still appear as its own bucket, not be
+        # silently dropped just because it has no settled position yet.
+        slug = "astatc-fwc-por-esp-2026-07-06-cor-all-gt6pt5"
+        open_orders = [{"id": "o1", "marketSlug": slug}]
+        order_details = {"o1": {"market_id": slug, "side": "BUY", "price": 0.5, "size": 4.0}}
+
+        exposures = compute_event_exposures(
+            {}, capital_reference_usd=100.0, open_orders=open_orders, order_details=order_details,
+        )
+        assert len(exposures) == 1
+        assert exposures[0].bucket_key == "fwc-por-esp-2026-07-06"
+        assert exposures[0].resting_worst_case_usd == pytest.approx(2.0)
+        assert exposures[0].cost_basis_usd == 0.0

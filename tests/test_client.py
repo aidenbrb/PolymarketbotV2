@@ -1,7 +1,13 @@
+import pytest
 import responses
+from urllib.parse import parse_qs, urlparse
 
 from polymarket_bot import config
-from polymarket_bot.polymarket_client import PolymarketClient, PolymarketClientError
+from polymarket_bot.polymarket_client import (
+    PolymarketClient,
+    PolymarketClientError,
+    PolymarketClientNotFound,
+)
 
 
 def _fast_settings(**overrides) -> config.APISettings:
@@ -29,6 +35,25 @@ def test_get_markets_single_page():
     markets = client.get_markets()
     assert len(markets) == 1
     assert markets[0]["slug"] == "m1"
+
+
+@responses.activate
+def test_get_markets_requests_newest_listings_first():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/markets",
+        json={"markets": []},
+        status=200,
+    )
+
+    PolymarketClient(settings=settings).get_markets()
+
+    query = parse_qs(urlparse(responses.calls[0].request.url).query)
+    assert query["active"] == ["true"]
+    assert query["closed"] == ["false"]
+    assert query["orderBy"] == ["created_at"]
+    assert query["orderDirection"] == ["desc"]
 
 
 @responses.activate
@@ -153,3 +178,157 @@ def test_get_market_book_missing_returns_none():
     responses.add(responses.GET, f"{settings.gateway_base_url}/v1/markets/m1/book", status=500)
     client = PolymarketClient(settings=settings)
     assert client.get_market_book("m1") is None
+
+
+@responses.activate
+def test_low_level_get_raises_not_found_on_404_without_retrying():
+    # A 404 is a clean, final answer ("this doesn't exist yet"), never a
+    # transient failure -- costs exactly one HTTP request, unlike a 5xx/
+    # network error which retries up to max_retries.
+    settings = _fast_settings(max_retries=3)
+    responses.add(responses.GET, f"{settings.gateway_base_url}/v1/markets/m1/settlement", status=404)
+    client = PolymarketClient(settings=settings)
+
+    with pytest.raises(PolymarketClientNotFound):
+        client._get(f"{settings.gateway_base_url}/v1/markets/m1/settlement")
+
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_market_settlement_returns_value_on_success():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/markets/m1/settlement",
+        json={"slug": "m1", "settlement": "1.0"},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    result = client.get_market_settlement("m1")
+
+    assert result == {"slug": "m1", "settlement": 1.0}
+
+
+@responses.activate
+def test_get_market_settlement_accepts_fractional_value():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/markets/m1/settlement",
+        json={"slug": "m1", "settlement": 0.37},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    result = client.get_market_settlement("m1")
+
+    assert result == {"slug": "m1", "settlement": 0.37}
+
+
+@responses.activate
+def test_get_market_settlement_returns_none_on_404():
+    settings = _fast_settings(max_retries=3)
+    responses.add(responses.GET, f"{settings.gateway_base_url}/v1/markets/m1/settlement", status=404)
+    client = PolymarketClient(settings=settings)
+
+    assert client.get_market_settlement("m1") is None
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_market_settlement_raises_on_slug_mismatch():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/markets/m1/settlement",
+        json={"slug": "m2", "settlement": 1.0},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    with pytest.raises(PolymarketClientError, match="mismatch"):
+        client.get_market_settlement("m1")
+
+
+@responses.activate
+def test_get_market_settlement_raises_on_out_of_range_value():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/markets/m1/settlement",
+        json={"slug": "m1", "settlement": 1.5},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    with pytest.raises(PolymarketClientError, match="out of range"):
+        client.get_market_settlement("m1")
+
+
+@responses.activate
+def test_get_market_settlement_raises_on_non_numeric_value():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/markets/m1/settlement",
+        json={"slug": "m1", "settlement": "not-a-number"},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    with pytest.raises(PolymarketClientError):
+        client.get_market_settlement("m1")
+
+
+@responses.activate
+def test_get_market_settlement_raises_after_exhausted_retries():
+    settings = _fast_settings(max_retries=2)
+    responses.add(responses.GET, f"{settings.gateway_base_url}/v1/markets/m1/settlement", status=500)
+    responses.add(responses.GET, f"{settings.gateway_base_url}/v1/markets/m1/settlement", status=500)
+    client = PolymarketClient(settings=settings)
+
+    with pytest.raises(PolymarketClientError):
+        client.get_market_settlement("m1")
+
+
+@responses.activate
+def test_get_market_metadata_returns_market_dict():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/market/slug/m1",
+        json={"market": {"slug": "m1", "closed": True, "status": "MARKET_STATUS_RESOLVED", "active": True}},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    metadata = client.get_market_metadata("m1")
+
+    assert metadata == {"slug": "m1", "closed": True, "status": "MARKET_STATUS_RESOLVED", "active": True}
+
+
+@responses.activate
+def test_get_market_metadata_returns_none_on_404():
+    settings = _fast_settings(max_retries=3)
+    responses.add(responses.GET, f"{settings.gateway_base_url}/v1/market/slug/m1", status=404)
+    client = PolymarketClient(settings=settings)
+
+    assert client.get_market_metadata("m1") is None
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_market_metadata_raises_on_missing_market_key():
+    settings = _fast_settings()
+    responses.add(
+        responses.GET,
+        f"{settings.gateway_base_url}/v1/market/slug/m1",
+        json={"unexpected": "shape"},
+        status=200,
+    )
+    client = PolymarketClient(settings=settings)
+
+    with pytest.raises(PolymarketClientError):
+        client.get_market_metadata("m1")

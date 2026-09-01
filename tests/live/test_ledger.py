@@ -1,9 +1,12 @@
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 import pytest
 
 from polymarket_bot import storage
 from polymarket_bot.live import ledger as ledger_module
+from polymarket_bot.live import fills as fills_module
+from polymarket_bot.live import settlements as settlements_module
 from polymarket_bot.live.ledger import (
     estimate_daily_pnl_usd,
     get_all_cycles,
@@ -13,6 +16,7 @@ from polymarket_bot.live.ledger import (
     get_known_order_ids,
     get_total_position_pnl_usd,
     record_cycle,
+    strategy_total_pnl_usd,
 )
 from polymarket_bot.live.models import LiveQuoteCycle, PostedLeg
 from polymarket_bot.live.us_client import UsApiError
@@ -22,6 +26,8 @@ from polymarket_bot.live.us_client import UsApiError
 def isolated_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger_module, "LEDGER_FILE", tmp_path / "orders.json")
     monkeypatch.setattr(ledger_module, "DAILY_BALANCE_FILE", tmp_path / "daily_pnl_baseline.json")
+    monkeypatch.setattr(fills_module, "FILLS_FILE", tmp_path / "fills.json")
+    monkeypatch.setattr(settlements_module, "SETTLEMENTS_FILE", tmp_path / "settlements.json")
 
 
 def _position(cost, cash_value, realized=0.0):
@@ -188,8 +194,8 @@ def test_get_known_order_details_collects_bid_and_ask_across_all_cycles(isolated
 
     details = get_known_order_details()
     assert details == {
-        "b1": {"market_id": "m1", "side": "BUY", "price": 0.49},
-        "a1": {"market_id": "m1", "side": "SELL", "price": 0.52},
+        "b1": {"market_id": "m1", "side": "BUY", "price": 0.49, "size": 100.0},
+        "a1": {"market_id": "m1", "side": "SELL", "price": 0.52, "size": 100.0},
     }
 
 
@@ -205,7 +211,7 @@ def test_get_known_order_details_ignores_legs_with_no_order_id(isolated_ledger):
     )
     record_cycle(cycle)
 
-    assert get_known_order_details() == {"a1": {"market_id": "m1", "side": "SELL", "price": 0.52}}
+    assert get_known_order_details() == {"a1": {"market_id": "m1", "side": "SELL", "price": 0.52, "size": 100.0}}
 
 
 def test_get_known_order_details_empty_when_no_cycles_recorded(isolated_ledger):
@@ -214,10 +220,10 @@ def test_get_known_order_details_empty_when_no_cycles_recorded(isolated_ledger):
 
 def test_get_known_order_details_skips_malformed_leg_but_keeps_valid_ones(isolated_ledger):
     storage.save_json(ledger_module.LEDGER_FILE, [
-        {"market_id": "m1", "bid": "not-a-dict", "ask": {"order_id": "a1", "side": "SELL", "price": 0.52}},
+        {"market_id": "m1", "bid": "not-a-dict", "ask": {"order_id": "a1", "side": "SELL", "price": 0.52, "size": 50.0}},
     ])
 
-    assert get_known_order_details() == {"a1": {"market_id": "m1", "side": "SELL", "price": 0.52}}
+    assert get_known_order_details() == {"a1": {"market_id": "m1", "side": "SELL", "price": 0.52, "size": 50.0}}
 
 
 def test_get_known_order_details_fails_closed_when_ledger_is_unreadable(isolated_ledger, caplog):
@@ -254,15 +260,32 @@ def test_get_known_order_details_maps_two_cycles_same_market_correctly(isolated_
     record_cycle(cycle_2)
 
     details = get_known_order_details()
-    assert details["b1"] == {"market_id": "m1", "side": "BUY", "price": 0.49}
-    assert details["a1"] == {"market_id": "m1", "side": "SELL", "price": 0.52}
-    assert details["b2"] == {"market_id": "m1", "side": "BUY", "price": 0.48}
-    assert details["a2"] == {"market_id": "m1", "side": "SELL", "price": 0.53}
+    assert details["b1"] == {"market_id": "m1", "side": "BUY", "price": 0.49, "size": 100.0}
+    assert details["a1"] == {"market_id": "m1", "side": "SELL", "price": 0.52, "size": 100.0}
+    assert details["b2"] == {"market_id": "m1", "side": "BUY", "price": 0.48, "size": 100.0}
+    assert details["a2"] == {"market_id": "m1", "side": "SELL", "price": 0.53, "size": 100.0}
 
 
 def test_get_known_order_id_markets_built_from_order_details(isolated_ledger):
     record_cycle(_cycle(cycle_id="c1"))
     assert get_known_order_id_markets() == {"b1": "m1", "a1": "m1"}
+
+
+def test_get_known_order_details_includes_size_from_posted_leg(isolated_ledger):
+    cycle = LiveQuoteCycle(
+        cycle_id="c1",
+        market_id="m1",
+        reference_price=0.5,
+        tick_size=0.01,
+        bid=PostedLeg(side="BUY", price=0.49, size=17.5, order_id="b1"),
+        ask=PostedLeg(side="SELL", price=0.52, size=6.0, order_id="a1"),
+        timestamp="2026-07-04T00:00:00+00:00",
+    )
+    record_cycle(cycle)
+
+    details = get_known_order_details()
+    assert details["b1"]["size"] == 17.5
+    assert details["a1"]["size"] == 6.0
 
 
 def test_get_cycles_since_filters_by_timestamp(isolated_ledger):
@@ -296,6 +319,36 @@ def test_get_total_position_pnl_usd_does_not_reset_across_days(isolated_ledger):
     first = get_total_position_pnl_usd(client)
     second = get_total_position_pnl_usd(client)
     assert first == second == pytest.approx(5.0)
+
+
+def test_strategy_pnl_keeps_loss_after_market_disappears_from_positions(isolated_ledger):
+    fills_module.overwrite_fills([
+        {
+            "fill_id": "open", "market_slug": "closed-market", "outcome": "YES",
+            "side": "BUY", "price": 0.5, "shares": 10.0,
+            "transact_time": "2026-07-10T10:00:00Z", "commission_usd": 0.0,
+            "raw_execution": {"order": {}},
+        },
+        {
+            "fill_id": "close", "market_slug": "closed-market", "outcome": "YES",
+            "side": "SELL", "price": 0.3, "shares": 10.0,
+            "transact_time": "2026-07-10T11:00:00Z", "commission_usd": 0.0,
+            "raw_execution": {"order": {}},
+        },
+    ])
+
+    assert strategy_total_pnl_usd({}) == pytest.approx(-2.0)
+
+
+def test_daily_baseline_resets_when_pnl_metric_version_changes(isolated_ledger):
+    storage.save_json(
+        ledger_module.DAILY_BALANCE_FILE,
+        {"date": datetime.now(timezone.utc).date().isoformat(), "baseline": 100.0},
+    )
+
+    assert ledger_module.diff_against_baseline(-4.0, ledger_module.DAILY_BALANCE_FILE) == 0.0
+    state = storage.load_json(ledger_module.DAILY_BALANCE_FILE)
+    assert state["metric_version"] == 2
 
 
 def test_estimate_daily_pnl_first_call_establishes_baseline(isolated_ledger):

@@ -19,6 +19,18 @@ class PostedLeg:
     order_id: Optional[str] = None
     error: Optional[str] = None
 
+    @property
+    def is_resting(self) -> bool:
+        """True only when this leg actually has live exposure on the
+        exchange right now. order_id alone isn't enough to tell: a leg
+        that was posted and then immediately cancelled (see
+        MarketMaker._unwind_unpaired_entry) deliberately keeps its
+        order_id -- so the ledger/execution-backfill can still discover a
+        partial fill from the submit-to-cancel race -- even though it has
+        nothing resting. size > 0 is what actually distinguishes the two
+        once order_id can be set either way."""
+        return bool(self.order_id) and self.size > 0
+
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
 
@@ -50,10 +62,12 @@ class FillRecord:
     """A single fill/execution detected on the private WebSocket
     (live/ws_private.py), enriched (best-effort) with the bot's own ledger
     data. See live/fills.py::build_fill_record and live/RUNBOOK.md's "-9."
-    section -- the private-WS execution schema is unverified against a real
-    fill, so every field below except fill_id/execution_type/detected_at/
-    raw_execution is honestly Optional and None when it can't be resolved,
-    not a guessed/default value."""
+    section. The private-WS execution schema has since been verified
+    against real fills (outcome, commission_usd, transact_time -- see the
+    field comments below and live/RUNBOOK.md's most recent sections), but
+    every field below except fill_id/execution_type/detected_at/
+    raw_execution stays honestly Optional and None when it can't be
+    resolved on a given fill, not a guessed/default value."""
 
     fill_id: str
     order_id: Optional[str]
@@ -61,6 +75,15 @@ class FillRecord:
     side: Optional[str]
     price: Optional[float]
     shares: Optional[float]
+    # "YES"/"NO", normalized from raw_execution["order"]["outcomeSide"]
+    # (falls back to marketMetadata.outcome). Part of true position
+    # identity -- market_slug ALONE is not unique: real fills exist on both
+    # outcome tokens of the same slug. See live/lot_accounting.py.
+    outcome: Optional[str]
+    # raw_execution["commissionNotionalCollected"]["value"] as a signed
+    # cash adjustment. Real-account verification found negative values reduce
+    # P&L; lot accounting therefore adds this signed amount directly.
+    commission_usd: Optional[float]
     execution_type: str
     transact_time: Optional[str]  # real exchange fill time (execution["transactTime"]), not detected_at
     quoted_price: Optional[float]
@@ -71,8 +94,18 @@ class FillRecord:
     markout_1m_computed_at: Optional[str]
     markout_5m_cents: Optional[float]
     markout_5m_computed_at: Optional[str]
+    markout_15m_cents: Optional[float]
+    markout_15m_computed_at: Optional[str]
     detected_at: str
     raw_execution: dict[str, Any]
+    # Executable-price counterparts to markout_1m/5m/15m_cents above: marked
+    # against best_bid (BUY) / best_ask (SELL) -- a price actually
+    # achievable to close the position -- rather than the midpoint, which
+    # can't actually be transacted at. Additive; the mid-based fields above
+    # are unchanged and still feed toxicity_tracker.py/family_performance.py.
+    executable_markout_1m_cents: Optional[float] = None
+    executable_markout_5m_cents: Optional[float] = None
+    executable_markout_15m_cents: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)

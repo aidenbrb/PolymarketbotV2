@@ -6,7 +6,9 @@ from tabulate import tabulate
 
 from .live.event_exposure import EventExposure
 from .live.family_performance import FamilyPerformance
-from .live.reconciliation import ReconciliationReport
+from .live.lot_accounting import LotAccountingResult
+from .live.pnl_attribution import PnlBreakdown, PnlSummary
+from .live.reconciliation import PnlReconciliationReport, ReconciliationReport
 from .models import FilterResult, PortfolioSnapshot, ScoredMarket
 
 # Ledger-known orders no longer open can realistically number in the
@@ -195,6 +197,7 @@ def render_fills(fills: list[dict]) -> str:
             f.get("fill_quality") or "-",
             f.get("markout_1m_cents") if f.get("markout_1m_cents") is not None else "-",
             f.get("markout_5m_cents") if f.get("markout_5m_cents") is not None else "-",
+            f.get("markout_15m_cents") if f.get("markout_15m_cents") is not None else "-",
         ]
         for f in reversed(sample)
     ]
@@ -202,12 +205,15 @@ def render_fills(fills: list[dict]) -> str:
         f"Showing {len(sample)} most recent of {len(fills)} recorded fill(s) "
         "(detected_at is when the bot noticed the fill, not necessarily "
         "when it executed; markout columns are blank until the fill's "
-        "1-minute/5-minute mark has actually passed -- see "
+        "1-minute/5-minute/15-minute mark has actually passed -- see "
         "live/RUNBOOK.md's \"-9.\" section):"
     )
     return header + "\n" + tabulate(
         rows,
-        headers=["Detected At", "Market", "Side", "Price", "Shares", "Quality", "Markout 1m", "Markout 5m"],
+        headers=[
+            "Detected At", "Market", "Side", "Price", "Shares", "Quality",
+            "Markout 1m", "Markout 5m", "Markout 15m",
+        ],
         tablefmt="simple",
     )
 
@@ -233,12 +239,17 @@ def render_event_exposure(exposures: list[EventExposure], capital_reference_usd:
     header += (
         "Bucket keys are inferred from market slugs (see "
         "live/RUNBOOK.md's most recent event-exposure section) -- most "
-        "concentrated first:"
+        "concentrated first. \"Projected\" includes still-open resting "
+        "orders' worst-case USD, matching what a live refresh cycle's own "
+        "cap enforcement actually sees -- not just settled positions:"
     )
 
     ordered = sorted(
         exposures,
-        key=lambda e: (e.pct_of_capital is not None, e.pct_of_capital or e.cost_basis_usd),
+        key=lambda e: (
+            e.projected_pct_of_capital is not None,
+            e.projected_pct_of_capital or (e.cost_basis_usd + e.resting_worst_case_usd),
+        ),
         reverse=True,
     )
     rows = [
@@ -246,15 +257,20 @@ def render_event_exposure(exposures: list[EventExposure], capital_reference_usd:
             e.bucket_key,
             e.market_count,
             _fmt_money(e.cost_basis_usd),
+            _fmt_money(e.resting_worst_case_usd),
             _fmt_money(e.cash_value_usd),
             _fmt_money(e.unrealized_pnl_usd),
             f"{e.pct_of_capital * 100:.1f}%" if e.pct_of_capital is not None else "-",
+            f"{e.projected_pct_of_capital * 100:.1f}%" if e.projected_pct_of_capital is not None else "-",
         ]
         for e in ordered
     ]
     return header + "\n" + tabulate(
         rows,
-        headers=["Event Bucket", "Markets", "Cost Basis", "Cash Value", "Unrealized P&L", "% of Capital"],
+        headers=[
+            "Event Bucket", "Markets", "Cost Basis", "Resting (worst-case)", "Cash Value",
+            "Unrealized P&L", "% of Capital", "% of Capital (proj.)",
+        ],
         tablefmt="simple",
     )
 
@@ -271,9 +287,9 @@ def render_family_performance(performances: list[FamilyPerformance]) -> str:
         "Family is a coarse, best-effort heuristic derived from each "
         "market's slug (see live/RUNBOOK.md's most recent risk-tightening "
         "section) -- not a guaranteed taxonomy. Markout (mark-to-market at "
-        "a fixed delay after the fill), NOT realized P&L -- this codebase "
-        "has no per-fill realized P&L attribution. Worst average 1-minute "
-        "markout first:"
+        "a fixed delay after the fill), NOT realized P&L -- see the "
+        "live-pnl command for actual realized P&L attribution. Worst "
+        "average 1-minute markout first:"
     )
 
     ordered = sorted(
@@ -291,6 +307,8 @@ def render_family_performance(performances: list[FamilyPerformance]) -> str:
             f"{p.median_markout_1m_cents:.2f}c" if p.median_markout_1m_cents is not None else "-",
             f"{p.avg_markout_5m_cents:.2f}c" if p.avg_markout_5m_cents is not None else "-",
             f"{p.median_markout_5m_cents:.2f}c" if p.median_markout_5m_cents is not None else "-",
+            f"{p.avg_markout_15m_cents:.2f}c" if p.avg_markout_15m_cents is not None else "-",
+            f"{p.median_markout_15m_cents:.2f}c" if p.median_markout_15m_cents is not None else "-",
             p.favorable_count,
             p.adverse_count,
             p.neutral_count,
@@ -301,9 +319,108 @@ def render_family_performance(performances: list[FamilyPerformance]) -> str:
     return header + "\n" + tabulate(
         rows,
         headers=[
-            "Family", "Fills", "Avg 1m", "Median 1m", "Avg 5m", "Median 5m",
+            "Family", "Fills", "Avg 1m", "Median 1m", "Avg 5m", "Median 5m", "Avg 15m", "Median 15m",
             "Favorable", "Adverse", "Neutral", "Unresolved",
         ],
+        tablefmt="simple",
+    )
+
+
+def render_pnl_attribution(
+    summary: PnlSummary, breakdowns: dict[str, list[PnlBreakdown]], lot_result: LotAccountingResult,
+) -> str:
+    if summary.closed_lot_count == 0 and summary.open_lot_count == 0:
+        return (
+            "No fills recorded yet. Requires live-start in WebSocket mode "
+            "with LIVE_ENABLE_PRIVATE_WEBSOCKET=true -- the REST-polling "
+            "runner never populates fills.json."
+        )
+
+    summary_rows = [
+        ["Total realized P&L", _fmt_money(summary.total_realized_pnl_usd)],
+        ["Total commission/rebate", _fmt_money(summary.total_commission_usd)],
+        ["Closed lots", summary.closed_lot_count],
+        ["  closed via fill", summary.closed_via_fill_count],
+        ["  closed via settlement", summary.closed_via_settlement_count],
+        ["Open lots", summary.open_lot_count],
+        ["  presumed settled, unresolved proceeds", summary.presumed_settled_unresolved_count],
+        ["Closed capital-hours", f"{summary.closed_capital_hours:,.2f}"],
+        ["Open capital-hours (ongoing)", f"{summary.open_capital_hours:,.2f}"],
+        [
+            "Realized P&L per closed capital-hour",
+            f"{summary.overall_pnl_per_capital_hour:.4f}"
+            if summary.overall_pnl_per_capital_hour is not None else "-",
+        ],
+    ]
+    sections = [
+        "Realized P&L attribution -- FIFO lot matching over fills.json, "
+        "closed out by any detected settlements. This IS actual realized "
+        "P&L (unlike live-family-performance's markout proxy). See "
+        "live/RUNBOOK.md's most recent section.",
+        tabulate(summary_rows, headers=["Metric", "Value"], tablefmt="simple"),
+    ]
+
+    for label, breakdown_rows in breakdowns.items():
+        if not breakdown_rows:
+            continue
+        rows = [
+            [
+                b.bucket,
+                b.lot_count,
+                _fmt_money(b.realized_pnl_usd),
+                _fmt_money(b.commission_usd),
+                f"{b.win_rate * 100:.0f}%" if b.win_rate is not None else "-",
+                f"{b.avg_holding_hours:.1f}h" if b.avg_holding_hours is not None else "-",
+                f"{b.pnl_per_capital_hour:.4f}" if b.pnl_per_capital_hour is not None else "-",
+            ]
+            for b in breakdown_rows
+        ]
+        sections.append(
+            f"\nBy {label} (most profitable first):\n" + tabulate(
+                rows,
+                headers=["Bucket", "Lots", "Realized P&L", "Commission", "Win Rate", "Avg Hold", "P&L/Cap-Hr"],
+                tablefmt="simple",
+            )
+        )
+
+    if lot_result.unmatched_closing_fills:
+        sections.append(
+            f"\n{len(lot_result.unmatched_closing_fills)} fill(s) reduce a position "
+            "this bot's own fill history never recorded opening (predates "
+            "tracking, or a gap) -- excluded from lot matching, not fabricated."
+        )
+    if lot_result.warnings:
+        sections.append(f"\n{len(lot_result.warnings)} warning(s) during lot matching -- see logs.")
+
+    return "\n".join(sections)
+
+
+def render_pnl_reconciliation(reports: list[PnlReconciliationReport]) -> str:
+    if not reports:
+        return "No closed lots yet -- nothing to reconcile."
+
+    header = (
+        "Cross-checks fill-based realized P&L (FIFO lot matching) against "
+        "the exchange's own latest realized-position-snapshot figure per "
+        "market. OPEN CAVEAT: whether the exchange's realized field is net "
+        "or gross of commission is unverified against real data yet -- "
+        "worst mismatch first:"
+    )
+    rows = [
+        [
+            r.market_slug,
+            r.lot_count,
+            _fmt_money(r.strategy_a_realized_usd),
+            _fmt_money(r.strategy_b_realized_usd) if r.strategy_b_realized_usd is not None else "-",
+            _fmt_money(r.delta_usd) if r.delta_usd is not None else "-",
+            "OK" if r.within_tolerance else "MISMATCH",
+            r.note or "",
+        ]
+        for r in reports
+    ]
+    return header + "\n" + tabulate(
+        rows,
+        headers=["Market", "Lots", "Strategy A (fills)", "Strategy B (exchange)", "Delta", "Status", "Note"],
         tablefmt="simple",
     )
 
